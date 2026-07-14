@@ -223,6 +223,44 @@ describe('dashboard operator API', () => {
     expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['retry-memory']);
   });
 
+  it('recovers a failed vector cleanup without exposing internal IDs', async () => {
+    dashboardService.listDashboardDuplicateMemoryIds
+      .mockResolvedValueOnce(['retry-memory'])
+      .mockResolvedValueOnce([]);
+    dashboardService.softDeleteDashboardMemories
+      .mockResolvedValueOnce(['retry-memory'])
+      .mockResolvedValueOnce([]);
+    dashboardService.listDashboardSoftDeletedMemoryIds
+      .mockResolvedValueOnce(['retry-memory'])
+      .mockResolvedValueOnce(['retry-memory']);
+    vectorize.deleteVectors
+      .mockRejectedValueOnce(new Error('Vectorize cleanup failed for retry-memory'))
+      .mockResolvedValueOnce(undefined);
+    const headers = { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' };
+    const body = JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true });
+
+    const failedResponse = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST', headers, body,
+    }), env);
+
+    expect(failedResponse.status).toBe(500);
+    const failedBody = await failedResponse.text();
+    expect(failedBody).not.toContain('retry-memory');
+    expect(failedBody).not.toContain('Vectorize');
+    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenNthCalledWith(1, env, 'agent', 'hermes', ['retry-memory']);
+    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenNthCalledWith(1, env, 'agent', 'hermes');
+
+    const recoveredResponse = await worker.fetch(request('/dashboard/api/deduplication', {
+      method: 'POST', headers, body,
+    }), env);
+
+    expect(recoveredResponse.status).toBe(200);
+    await expect(recoveredResponse.json()).resolves.toEqual({ removed: 0 });
+    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenNthCalledWith(2, env, 'agent', 'hermes', []);
+    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenNthCalledWith(2, env, 'agent', 'hermes');
+    expect(vectorize.deleteVectors).toHaveBeenNthCalledWith(2, env.VECTORIZE, ['retry-memory']);
+  });
+
   it('discovers users through the dashboard service', async () => {
     dashboardService.listDashboardUsers.mockResolvedValue([
       { user_id: 'discord:42', alias: 'Shuhao', memory_count: 3 },
