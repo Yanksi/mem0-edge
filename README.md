@@ -93,6 +93,37 @@ Use the **User profile** selector to scope the three views:
 
 The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
+### Import from Mem0
+
+The dashboard's **Import from Mem0** view accepts the same `RawMemoryMigrationExport` source either by selecting a `.json` file or by pasting JSON into the textarea. Selecting a `.json` file loads its contents into that textarea. Its filename base becomes the target user ID until the target-user-ID field is manually edited; a manual value is never replaced by later file selections.
+
+The accepted export is exactly this JSON Schema:
+
+```json
+{
+  "type": "object",
+  "title": "RawMemoryMigrationExport",
+  "required": ["memories"],
+  "properties": {
+    "memories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["memory"],
+        "properties": {
+          "memory": { "type": "string", "description": "The exact original memory text, preserved verbatim." },
+          "created_at": { "anyOf": [{ "type": "string" }, { "type": "null" }], "description": "Original creation timestamp if available; otherwise null." },
+          "updated_at": { "anyOf": [{ "type": "string" }, { "type": "null" }], "description": "Original update timestamp if available; otherwise null." }
+        }
+      },
+      "description": "All matching memories. Preserve every source memory as a separate item. Do not merge, summarize, infer, rewrite, or omit memories."
+    }
+  }
+}
+```
+
+Submitting posts `{ "user_id": "...", "export": { ... } }` to the signed-session dashboard endpoint `/dashboard/api/imports/mem0`. It returns a queued count and processing continues asynchronously through Cloudflare Queues. Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time); import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference.
+
 ### Add a memory
 
 ```sh

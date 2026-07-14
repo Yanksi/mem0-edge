@@ -13,10 +13,14 @@ const graphService = vi.hoisted(() => ({
 const memoryService = vi.hoisted(() => ({
   searchMemories: vi.fn(),
 }));
+const importService = vi.hoisted(() => ({
+  enqueueMem0Import: vi.fn(),
+}));
 
 vi.mock('../src/dashboard/service', () => dashboardService);
 vi.mock('../src/graph/service', () => graphService);
 vi.mock('../src/memory/service', () => memoryService);
+vi.mock('../src/import/service', () => importService);
 
 import worker from '../src/index';
 
@@ -114,5 +118,36 @@ describe('dashboard operator API', () => {
     });
     expect(graphService.listEntities).toHaveBeenCalledWith(env, 'discord:42');
     expect(graphService.listRelationships).toHaveBeenCalledWith(env, 'discord:42');
+  });
+
+  it('accepts a signed Mem0 import and queues every exported memory', async () => {
+    importService.enqueueMem0Import.mockResolvedValue(2);
+    const exportPayload = {
+      memories: [
+        { memory: 'User lives in Zurich.', created_at: '2024-01-01T00:00:00.000Z', updated_at: null },
+        { memory: 'User likes espresso.', created_at: null, updated_at: '2024-02-01T00:00:00.000Z' },
+      ],
+    };
+
+    const response = await worker.fetch(request('/dashboard/api/imports/mem0', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: 'discord:42', export: exportPayload }),
+    }), env);
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ queued: 2 });
+    expect(importService.enqueueMem0Import).toHaveBeenCalledWith(env, 'discord:42', exportPayload);
+  });
+
+  it('rejects malformed Mem0 imports before queueing', async () => {
+    const response = await worker.fetch(request('/dashboard/api/imports/mem0', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: 'discord:42', export: { memories: [{ memory: '', created_at: 'not-a-date', updated_at: null }] } }),
+    }), env);
+
+    expect(response.status).toBe(400);
+    expect(importService.enqueueMem0Import).not.toHaveBeenCalled();
   });
 });

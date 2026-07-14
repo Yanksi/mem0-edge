@@ -68,6 +68,20 @@ describe('GET /dashboard', () => {
     expect(html).toContain('/dashboard/api/memories');
     expect(html).toContain('/dashboard/api/graph');
   });
+
+  it('renders the Mem0 import view and its client-side import contract', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), env);
+    const html = await response.text();
+
+    expect(html).toContain('data-view="import"');
+    expect(html).toContain('name="target_user_id"');
+    expect(html).toContain('name="export_json"');
+    expect(html).toContain('RawMemoryMigrationExport');
+    expect(html).toContain('/dashboard/api/imports/mem0');
+    expect(html).toContain('queued');
+  });
 });
 
 describe('dashboard login', () => {

@@ -4,6 +4,8 @@ import { renderDashboard, renderDashboardLogin } from '../dashboard/page';
 import { listDashboardMemories, listDashboardUsers, setDashboardUserAlias } from '../dashboard/service';
 import type { Env } from '../env';
 import { listEntities, listRelationships } from '../graph/service';
+import { enqueueMem0Import } from '../import/service';
+import { DashboardMem0ImportRequest } from '../import/types';
 import { searchMemories } from '../memory/service';
 
 export const dashboardRoutes = new Hono<{ Bindings: Env }>();
@@ -72,6 +74,15 @@ dashboardRoutes.post('/api/search', async (context) => {
     limit: 10,
     filters: {},
   }) });
+});
+
+dashboardRoutes.post('/api/imports/mem0', async (context) => {
+  const body = await context.req.json<unknown>().catch(() => null);
+  const parsed = DashboardMem0ImportRequest.safeParse(body);
+  if (!parsed.success) return context.json({ error: 'Validation failed' }, 400);
+
+  const queued = await enqueueMem0Import(context.env, parsed.data.user_id, parsed.data.export);
+  return context.json({ queued }, 202);
 });
 
 dashboardRoutes.get('/api/graph', async (context) => {

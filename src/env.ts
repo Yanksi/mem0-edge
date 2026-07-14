@@ -1,8 +1,20 @@
-export interface MemoryJob {
+import type { RawMemoryMigrationItem } from './import/types';
+
+export interface ExtractMemoryJob {
   type: 'extract-and-store';
   requestId: string;
   body: unknown;
 }
+
+export interface Mem0ImportJob {
+  type: 'import-mem0-memory';
+  requestId: string;
+  userId: string;
+  item: RawMemoryMigrationItem;
+  body?: never;
+}
+
+export type MemoryJob = ExtractMemoryJob | Mem0ImportJob;
 
 export interface Env {
   DB: D1Database;
