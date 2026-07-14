@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import * as dashboardPage from '../src/dashboard/page';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 
@@ -39,21 +38,35 @@ describe('GET /dashboard', () => {
     expect(response.status).toBe(200);
   });
 
-  it('renders the title and memory search controls through the default worker fetch handler', async () => {
+  it('renders the title and dashboard-managed memory search controls through the default worker fetch handler', async () => {
     const response = await worker.fetch(request('/dashboard', {
       headers: { 'x-dashboard-password': 'dashboard-secret' },
     }), env);
     const html = await response.text();
 
     expect(html).toContain('<title>Mem0 Edge Dashboard</title>');
-    expect(html).toContain('name="api_key"');
     expect(html).toContain('name="user_id"');
     expect(html).toContain('name="query"');
     expect(html).toContain('type="submit"');
-    expect(html).toContain('/v1/memories/search');
-    expect(html).toContain("result.textContent = 'Searching...'");
+    expect(html).toContain('/dashboard/api/search');
+    expect(html).toContain("status.textContent = 'Searching...'");
     expect(html).toContain('catch (error)');
-    expect(html).toContain("'Search failed'");
+    expect(html).toContain("'Request failed'");
+    expect(html).not.toContain('name="api_key"');
+  });
+
+  it('renders the operator navigation and dashboard data endpoints', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), env);
+    const html = await response.text();
+
+    expect(html).toContain('data-view="search"');
+    expect(html).toContain('data-view="memories"');
+    expect(html).toContain('data-view="graph"');
+    expect(html).toContain('/dashboard/api/users');
+    expect(html).toContain('/dashboard/api/memories');
+    expect(html).toContain('/dashboard/api/graph');
   });
 });
 
@@ -132,30 +145,5 @@ describe('dashboard login', () => {
 
     expect(response.status).toBe(303);
     expect(response.headers.get('Set-Cookie')).toContain('Max-Age=0');
-  });
-});
-
-describe('dashboard search request', () => {
-  it('builds an authenticated JSON POST without exposing the API key in the URL', () => {
-    const { buildDashboardSearchRequest } = dashboardPage as typeof dashboardPage & {
-      buildDashboardSearchRequest: (apiKey: string, userId: string, query: string) => {
-        url: string;
-        init: RequestInit;
-      };
-    };
-
-    const request = buildDashboardSearchRequest('secret-api-key', 'user-123', 'Where does the user live?');
-
-    expect(request.url).toBe('/v1/memories/search');
-    expect(request.url).not.toContain('secret-api-key');
-    expect(request.init.method).toBe('POST');
-    expect(request.init.headers).toEqual({
-      Authorization: 'Bearer secret-api-key',
-      'Content-Type': 'application/json',
-    });
-    expect(request.init.body).toBe(JSON.stringify({
-      user_id: 'user-123',
-      query: 'Where does the user live?',
-    }));
   });
 });

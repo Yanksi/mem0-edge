@@ -16,7 +16,8 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - D1-backed memory metadata, audit history, graph-lite entities, relationships, and memory/entity links.
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and a Queue consumer for asynchronous ingestion.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
-- API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard.
+- API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
+- Dashboard views for semantic search, paginated active-memory browsing, a bounded entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
 ## Not Included
@@ -27,6 +28,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - A Neo4j-style graph engine, unbounded graph traversal, or advanced graph analytics; graph support is bounded D1-backed storage and reads.
 - Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize index, Queue, metadata indexes, and secrets described below.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
+- Dashboard memory editing, deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view. The dashboard can only create, change, or remove display aliases for stored user IDs.
 
 ## Architecture
 
@@ -78,6 +80,18 @@ The Worker also supports the request contract used by Hermes's self-hosted Mem0 
 ```
 
 The request is idempotent; use `request_id` when the caller needs a stable caller-supplied key.
+
+## Dashboard
+
+Open `$MEM0_URL/dashboard` and sign in with `DASHBOARD_PASSWORD`. The dashboard discovers user IDs from active memories, stored graph entities, and any previously saved aliases. It never uses the service API key in the browser.
+
+Use the **User profile** selector to scope the three views:
+
+- **Search memory** performs semantic recall for the selected user.
+- **All memories** displays that user's active memories, newest first, with pagination and a detail inspector.
+- **Memory graph** displays that user's stored entities and relationships as a bounded interactive graph.
+
+The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
 ### Add a memory
 

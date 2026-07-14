@@ -1,7 +1,10 @@
 import { Hono } from 'hono';
 import { checkDashboardPassword } from '../auth';
 import { renderDashboard, renderDashboardLogin } from '../dashboard/page';
+import { listDashboardMemories, listDashboardUsers, setDashboardUserAlias } from '../dashboard/service';
 import type { Env } from '../env';
+import { listEntities, listRelationships } from '../graph/service';
+import { searchMemories } from '../memory/service';
 
 export const dashboardRoutes = new Hono<{ Bindings: Env }>();
 
@@ -30,6 +33,55 @@ dashboardRoutes.post('/login', async (context) => {
 dashboardRoutes.post('/logout', (context) => {
   context.header('Set-Cookie', `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`);
   return context.redirect('/dashboard', 303);
+});
+
+dashboardRoutes.use('/api/*', async (context, next) => {
+  if (!await hasValidDashboardSession(context.req.header('Cookie'), context.env.DASHBOARD_PASSWORD)) {
+    return context.json({ error: 'Unauthorized' }, 401);
+  }
+  await next();
+});
+
+dashboardRoutes.get('/api/users', async (context) => {
+  return context.json({ results: await listDashboardUsers(context.env) });
+});
+
+dashboardRoutes.put('/api/users/:userId/alias', async (context) => {
+  const body = await context.req.json<{ alias?: unknown }>().catch(() => null);
+  if (body === null || typeof body.alias !== 'string') return context.json({ error: 'Validation failed' }, 400);
+  await setDashboardUserAlias(context.env, context.req.param('userId'), body.alias);
+  return context.json({ ok: true });
+});
+
+dashboardRoutes.get('/api/memories', async (context) => {
+  const userId = context.req.query('user_id');
+  if (userId === undefined || userId.trim() === '') return context.json({ error: 'Validation failed' }, 400);
+  const requestedOffset = Number(context.req.query('offset') ?? '0');
+  const offset = Number.isInteger(requestedOffset) && requestedOffset >= 0 ? requestedOffset : 0;
+  return context.json(await listDashboardMemories(context.env, userId, offset));
+});
+
+dashboardRoutes.post('/api/search', async (context) => {
+  const body = await context.req.json<{ user_id?: unknown; query?: unknown }>().catch(() => null);
+  if (body === null || typeof body.user_id !== 'string' || body.user_id.trim() === '' || typeof body.query !== 'string') {
+    return context.json({ error: 'Validation failed' }, 400);
+  }
+  return context.json({ results: await searchMemories(context.env, {
+    user_id: body.user_id,
+    query: body.query,
+    limit: 10,
+    filters: {},
+  }) });
+});
+
+dashboardRoutes.get('/api/graph', async (context) => {
+  const userId = context.req.query('user_id');
+  if (userId === undefined || userId.trim() === '') return context.json({ error: 'Validation failed' }, 400);
+  const [entities, relationships] = await Promise.all([
+    listEntities(context.env, userId),
+    listRelationships(context.env, userId),
+  ]);
+  return context.json({ entities, relationships });
 });
 
 async function createDashboardSessionCookie(password: string): Promise<string> {

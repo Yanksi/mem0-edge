@@ -147,3 +147,13 @@ export const memoryRequests = sqliteTable(
     index('memory_requests_status_updated_at_idx').on(table.status, table.updatedAt),
   ],
 );
+
+export const userAliases = sqliteTable(
+  'user_aliases',
+  {
+    userId: text('user_id').primaryKey(),
+    alias: text('alias').notNull(),
+    createdAt,
+    updatedAt,
+  },
+);
