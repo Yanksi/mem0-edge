@@ -44,6 +44,20 @@ describe('embedText', () => {
     );
   });
 
+  it('does not inherit the extraction endpoint when the embedding endpoint is absent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ embedding: [0.1] }] }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await embedText({ ...env, LLM_API_BASE_URL: 'https://extract.example/v1' }, 'text');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.openai.com/v1/embeddings',
+      expect.anything(),
+    );
+  });
+
   it('throws descriptive errors for failed embedding responses, malformed JSON, and missing embeddings', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('rate limited', { status: 429, statusText: 'Too Many Requests' })));
     await expect(embedText(env, 'text')).rejects.toThrow('OpenAI embeddings request failed (429 Too Many Requests)');

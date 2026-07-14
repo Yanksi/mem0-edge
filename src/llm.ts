@@ -127,7 +127,7 @@ function extractionBaseUrl(env: Env): string {
 }
 
 function embeddingBaseUrl(env: Env): string {
-  return normalizeBaseUrl(env.EMBEDDING_API_BASE_URL || env.LLM_API_BASE_URL || DEFAULT_OPENAI_API_BASE_URL);
+  return normalizeBaseUrl(env.EMBEDDING_API_BASE_URL || DEFAULT_OPENAI_API_BASE_URL);
 }
 
 function normalizeBaseUrl(value: string): string {

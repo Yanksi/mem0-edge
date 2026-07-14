@@ -43,9 +43,9 @@ All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard 
 - **Extraction model:** `gpt-4o-mini` (`LLM_MODEL`)
 - **Embedding model:** `text-embedding-3-small` (`EMBEDDING_MODEL`)
 - **Extraction endpoint:** `https://api.openai.com/v1` by default (`LLM_API_BASE_URL`)
-- **Embedding endpoint:** `EMBEDDING_API_BASE_URL`, or `LLM_API_BASE_URL` when it is omitted
+- **Embedding endpoint:** `https://api.openai.com/v1` by default (`EMBEDDING_API_BASE_URL`)
 
-Both endpoints must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored.
+Both endpoints are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored.
 
 ### Hermes compatibility
 
@@ -128,8 +128,7 @@ Models and endpoints are normal Worker variables, not secrets. Set their deploye
 LLM_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
 LLM_API_BASE_URL=https://api.openai.com/v1
-# Optional: an empty value falls back to LLM_API_BASE_URL.
-EMBEDDING_API_BASE_URL=
+EMBEDDING_API_BASE_URL=https://api.openai.com/v1
 ```
 
 `LLM_MODEL` and `EMBEDDING_MODEL` are configurable independently. Ensure the selected embedding model returns **1,536 dimensions or fewer**: Cloudflare Vectorize currently caps vectors at 1,536 float32 dimensions. This Worker rejects larger embedding responses before attempting an upsert. [Cloudflare Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/)
