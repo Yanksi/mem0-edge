@@ -13,6 +13,7 @@ app.get('/health', (context) => context.json({ ok: true, service: 'mem0-edge' })
 app.route('/dashboard', dashboardRoutes);
 app.route('/', hermesRoutes);
 app.route('/v1/memories', memoriesRoutes);
+app.route('/v1', hermesRoutes);
 app.route('/v1/entities', entitiesRoutes);
 app.route('/v1/relationships', relationshipsRoutes);
 

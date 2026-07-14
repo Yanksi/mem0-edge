@@ -51,11 +51,24 @@ Both endpoints are configured independently and must implement the OpenAI-compat
 
 ### Hermes compatibility
 
-The Worker also supports the request contract used by Hermes's self-hosted Mem0 adapter:
+The Worker supports the request contract used by Hermes's self-hosted Mem0 adapter when Hermes is configured with a `/v1` base URL:
 
-- `POST /memories` accepts `X-API-Key: $MEM0_API_KEY` and the standard Mem0 add payload.
-- `POST /search` accepts `X-API-Key: $MEM0_API_KEY`, `top_k`, and `filters.user_id`.
-- `PUT /memories/:id` and `DELETE /memories/:id` support Hermes's ID-based update and delete calls; the Worker resolves the stored owner before applying its normal user-scoped operation.
+- `POST /v1/memories` accepts `X-API-Key: $MEM0_API_KEY` and the standard Mem0 add payload.
+- `POST /v1/search` and `POST /v1/memories/search` accept `top_k` plus `filters.user_id`; optional `agent_id`, `run_id`, and `actor_id` are scoped fields, while other filters are preserved as Vectorize metadata filters.
+- `PUT /v1/memories/:id` accepts `{ "text": "..." }`, while native `PATCH` continues to accept `{ "memory": "..." }`.
+- `DELETE /v1/memories/:id` resolves the stored user owner when Hermes omits a `user_id` query parameter. Memory IDs are opaque strings, including the Worker-generated SHA-256 IDs.
+
+Example Hermes configuration:
+
+```json
+{
+  "mode": "platform",
+  "host": "https://your-worker.example/v1",
+  "user_id": "stable-user-id",
+  "agent_id": "stable-agent-id",
+  "rerank": false
+}
+```
 
 `user_id` remains the profile boundary. Configure Hermes with a stable `MEM0_USER_ID` to merge one person's memories across gateways, or leave it unset to let Hermes use its gateway-native identity (for example, a Discord user ID). The API key only authenticates the trusted Hermes gateway; it does not bind a request to a user ID.
 
@@ -66,8 +79,10 @@ The Worker also supports the request contract used by Hermes's self-hosted Mem0 
 | `GET` | `/health` | Service health response. |
 | `POST` | `/v1/memories` | Add/extract memories; supports synchronous and queued work. |
 | `POST` | `/v1/memories/search` | Semantic search, scoped by `user_id` and optional identity fields. |
+| `POST` | `/v1/search` | Hermes-compatible semantic search using `top_k` and identity values inside `filters`. |
 | `GET` | `/v1/memories?user_id=...&limit=...` | List a user's active memories. |
-| `GET`, `PATCH`, `DELETE` | `/v1/memories/:id?user_id=...` | Read, update, or delete a memory. |
+| `GET`, `PATCH`, `DELETE` | `/v1/memories/:id?user_id=...` | Native read, update, or delete a memory. |
+| `PUT`, `DELETE` | `/v1/memories/:id` | Hermes-compatible update or delete using the stored user owner. |
 | `GET` | `/v1/entities?user_id=...` | List graph-lite entities. |
 | `GET` | `/v1/entities/:id?user_id=...` | Get a graph-lite entity. |
 | `GET` | `/v1/relationships?user_id=...&entity_id=...` | List graph-lite relationships. |

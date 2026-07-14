@@ -577,4 +577,70 @@ describe('Hermes self-hosted compatibility routes', () => {
     });
     expect(service.deleteMemory).toHaveBeenCalledWith(env, 'memory-123', 'user-123');
   });
+
+  it('accepts Hermes search requests at /v1/search and keeps identity filters out of metadata filters', async () => {
+    service.searchMemories.mockResolvedValue([{ ...memory, score: 0.98 }]);
+
+    const response = await worker.fetch(request('/v1/search', {
+      method: 'POST',
+      headers: { 'X-API-Key': 'test-api-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'Where does the user live?',
+        top_k: 7,
+        filters: {
+          user_id: 'hermes-user',
+          agent_id: 'neko-chan',
+          run_id: 'run-123',
+          channel: 'discord',
+        },
+      }),
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ results: [{ ...memory, score: 0.98 }] });
+    expect(service.searchMemories).toHaveBeenCalledWith(env, {
+      query: 'Where does the user live?',
+      user_id: 'hermes-user',
+      agent_id: 'neko-chan',
+      run_id: 'run-123',
+      limit: 7,
+      filters: { channel: 'discord' },
+    });
+  });
+
+  it('accepts the Hermes search body at the native search path', async () => {
+    service.searchMemories.mockResolvedValue([]);
+
+    const response = await worker.fetch(request('/v1/memories/search', {
+      method: 'POST',
+      headers: { 'X-API-Key': 'test-api-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'Where does the user live?', top_k: 7, filters: { user_id: 'hermes-user' } }),
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(service.searchMemories).toHaveBeenCalledWith(env, {
+      query: 'Where does the user live?', user_id: 'hermes-user', limit: 7, filters: {},
+    });
+  });
+
+  it('resolves a SHA-256-like ID for Hermes /v1 PUT and DELETE requests', async () => {
+    const id = 'a'.repeat(64);
+    service.getMemoryById.mockResolvedValue({ ...memory, id });
+    service.updateMemory.mockResolvedValue({ ...memory, id, memory: 'User now lives in Bern.' });
+    service.deleteMemory.mockResolvedValue(true);
+
+    const updated = await worker.fetch(request(`/v1/memories/${id}`, {
+      method: 'PUT',
+      headers: { 'X-API-Key': 'test-api-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'User now lives in Bern.' }),
+    }), env);
+    const deleted = await worker.fetch(request(`/v1/memories/${id}`, {
+      method: 'DELETE', headers: { 'X-API-Key': 'test-api-key' },
+    }), env);
+
+    expect(updated.status).toBe(200);
+    expect(deleted.status).toBe(200);
+    expect(service.updateMemory).toHaveBeenCalledWith(env, id, 'user-123', { memory: 'User now lives in Bern.' });
+    expect(service.deleteMemory).toHaveBeenCalledWith(env, id, 'user-123');
+  });
 });

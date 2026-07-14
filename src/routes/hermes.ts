@@ -3,13 +3,8 @@ import { z, ZodError } from 'zod';
 import { apiAuth } from '../auth';
 import type { Env } from '../env';
 import { addMemory, deleteMemory, getMemoryById, searchMemories, updateMemory } from '../memory/service';
-import { AddMemoryRequestSchema } from '../memory/types';
-
-const HermesSearchRequestSchema = z.object({
-  query: z.string(),
-  top_k: z.number().int().positive().max(50).default(10),
-  filters: z.object({ user_id: z.string().trim().min(1) }).passthrough(),
-});
+import { AddMemoryRequestSchema, HermesSearchRequestSchema } from '../memory/types';
+import type { HermesSearchRequest, SearchMemoryRequest } from '../memory/types';
 const HermesUpdateRequestSchema = z.object({ text: z.string().trim().min(1) });
 
 export const hermesRoutes = new Hono<{ Bindings: Env }>();
@@ -28,14 +23,8 @@ hermesRoutes.post('/memories', async (context) => {
 hermesRoutes.post('/search', async (context) => {
   const request = await parseBody(context.req.raw, HermesSearchRequestSchema);
   if (request instanceof Response) return request;
-  const { user_id, ...filters } = request.filters;
   return context.json({
-    results: await searchMemories(context.env, {
-      query: request.query,
-      user_id,
-      limit: request.top_k,
-      filters,
-    }),
+    results: await searchMemories(context.env, normalizeHermesSearch(request)),
   });
 });
 
@@ -66,6 +55,19 @@ async function parseBody<T>(request: Request, schema: { parse(value: unknown): T
       ...(error instanceof ZodError ? { details: error.issues } : {}),
     }, { status: 400 });
   }
+}
+
+export function normalizeHermesSearch(request: HermesSearchRequest): SearchMemoryRequest {
+  const { user_id, agent_id, run_id, actor_id, ...filters } = request.filters;
+  return {
+    query: request.query,
+    user_id,
+    ...(agent_id === undefined ? {} : { agent_id }),
+    ...(run_id === undefined ? {} : { run_id }),
+    ...(actor_id === undefined ? {} : { actor_id }),
+    limit: request.top_k,
+    filters,
+  };
 }
 
 function notFound(context: { json: (body: { error: string }, status: 404) => Response }): Response {

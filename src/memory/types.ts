@@ -32,6 +32,17 @@ export const SearchMemoryRequestSchema = z.object({
   message: 'Either user_id or agent_id is required',
 });
 
+export const HermesSearchRequestSchema = z.object({
+  query: z.string(),
+  top_k: z.number().int().positive().max(50).default(10),
+  filters: z.object({
+    user_id: nonEmptyString,
+    agent_id: nonEmptyString.optional(),
+    run_id: nonEmptyString.optional(),
+    actor_id: nonEmptyString.optional(),
+  }).passthrough(),
+});
+
 export const UpdateMemoryRequestSchema = z.object({
   memory: nonEmptyString.optional(),
   metadata: record.optional(),
@@ -54,6 +65,7 @@ export const MemoryResponseSchema = z.object({
 
 export type AddMemoryRequest = z.infer<typeof AddMemoryRequestSchema>;
 export type SearchMemoryRequest = z.infer<typeof SearchMemoryRequestSchema>;
+export type HermesSearchRequest = z.infer<typeof HermesSearchRequestSchema>;
 export type UpdateMemoryRequest = z.infer<typeof UpdateMemoryRequestSchema>;
 export type MemoryResponse = z.infer<typeof MemoryResponseSchema>;
 

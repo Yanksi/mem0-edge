@@ -6,15 +6,18 @@ import {
   addMemory,
   deleteMemory,
   getMemory,
+  getMemoryById,
   listMemories,
   searchMemories,
   updateMemory,
 } from '../memory/service';
 import {
   AddMemoryRequestSchema,
+  HermesSearchRequestSchema,
   SearchMemoryRequestSchema,
   UpdateMemoryRequestSchema,
 } from '../memory/types';
+import { normalizeHermesSearch } from './hermes';
 
 export const memoriesRoutes = new Hono<{ Bindings: Env }>();
 
@@ -30,7 +33,7 @@ memoriesRoutes.post('/', async (context) => {
 });
 
 memoriesRoutes.post('/search', async (context) => {
-  const request = await parseBody(context.req.raw, SearchMemoryRequestSchema);
+  const request = await parseSearchBody(context.req.raw);
   if (request instanceof Response) return request;
   return context.json({ results: await searchMemories(context.env, request) });
 });
@@ -60,11 +63,28 @@ memoriesRoutes.patch('/:id', async (context) => {
 });
 
 memoriesRoutes.delete('/:id', async (context) => {
-  const userId = requiredUserId(context.req.query('user_id'));
-  if (userId instanceof Response) return userId;
+  const requestedUserId = context.req.query('user_id');
+  if (requestedUserId !== undefined && requestedUserId.trim() === '') return validationError();
+  const memory = requestedUserId === undefined ? await getMemoryById(context.env, context.req.param('id')) : null;
+  if (memory !== null && memory !== undefined && memory.user_id === undefined) return context.json({ error: 'Memory is not user-scoped' }, 409);
+  const userId = requestedUserId ?? memory?.user_id;
+  if (userId === undefined) return memory === null ? notFound(context) : validationError();
   const deleted = await deleteMemory(context.env, context.req.param('id'), userId);
   return deleted ? context.json({ deleted: true }) : notFound(context);
 });
+
+async function parseSearchBody(request: Request): Promise<import('../memory/types').SearchMemoryRequest | Response> {
+  try {
+    const body: unknown = await request.json();
+    const native = SearchMemoryRequestSchema.safeParse(body);
+    if (native.success) return native.data;
+    const hermes = HermesSearchRequestSchema.safeParse(body);
+    if (hermes.success) return normalizeHermesSearch(hermes.data);
+    return validationError(native.error.issues);
+  } catch {
+    return validationError();
+  }
+}
 
 async function parseBody<T>(request: Request, schema: { parse(value: unknown): T }): Promise<T | Response> {
   try {
