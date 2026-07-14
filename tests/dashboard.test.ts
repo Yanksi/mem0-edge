@@ -69,6 +69,19 @@ describe('GET /dashboard', () => {
     expect(html).toContain('/dashboard/api/graph');
   });
 
+  it('pins the desktop navigation and renders memory detail panels inline', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), env);
+    const html = await response.text();
+
+    expect(html).toContain('position: fixed');
+    expect(html).toContain('padding-left: 208px');
+    expect(html).toContain('memory-summary');
+    expect(html).toContain('memory-detail');
+    expect(html).toContain('row.append(summary, detail)');
+  });
+
   it('renders the Mem0 import view and its client-side import contract', async () => {
     const response = await worker.fetch(request('/dashboard', {
       headers: { 'x-dashboard-password': 'dashboard-secret' },
