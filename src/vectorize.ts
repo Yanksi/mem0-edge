@@ -14,6 +14,10 @@ export function deleteVector(index: VectorizeIndex, id: string) {
   return index.deleteByIds([id]);
 }
 
+export function deleteVectors(index: VectorizeIndex, ids: string[]) {
+  return index.deleteByIds(ids);
+}
+
 export async function searchVectors(
   index: VectorizeIndex,
   vector: number[],

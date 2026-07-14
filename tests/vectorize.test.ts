@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { SearchMemoryRequest } from '../src/memory/types';
-import { deleteVector, searchVectors, type VectorSearchResult, upsertVectors } from '../src/vectorize';
+import { deleteVector, deleteVectors, searchVectors, type VectorSearchResult, upsertVectors } from '../src/vectorize';
 
 expectTypeOf<VectorSearchResult['metadata']>().toEqualTypeOf<Record<string, VectorizeVectorMetadataValue> | undefined>();
 
@@ -17,6 +17,16 @@ describe('Vectorize wrappers', () => {
 
     expect(index.upsert).toHaveBeenCalledWith(records);
     expect(index.deleteByIds).toHaveBeenCalledWith(['memory-123']);
+  });
+
+  it('deletes a batch of duplicate vector IDs in one call', async () => {
+    const index = { deleteByIds: vi.fn().mockResolvedValue({}) } as unknown as VectorizeIndex;
+    const ids = ['memory-456', 'memory-789'];
+
+    await deleteVectors(index, ids);
+
+    expect(index.deleteByIds).toHaveBeenCalledOnce();
+    expect(index.deleteByIds).toHaveBeenCalledWith(ids);
   });
 
   it('caps topK, scopes its filter, returns metadata, and omits vector values', async () => {
