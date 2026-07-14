@@ -4,9 +4,9 @@ Deployable edge memory service for Cloudflare Workers. It provides a compact, Op
 
 This is **not** the full Python Mem0 implementation. It deliberately uses D1 for graph-lite entities and relationships, Cloudflare Vectorize for retrieval, and the OpenAI-compatible API surface implemented in this Worker. Full Python Mem0 feature parity, provider breadth, and a graph database are out of scope by default.
 
-[![Deploy to Cloudflare](https://deploy.cloudflare.com/button)](https://deploy.cloudflare.com/?url=https://github.com/YOUR_ORG/mem-worker)
+[![Deploy to Cloudflare](https://deploy.cloudflare.com/button)](https://deploy.cloudflare.com/?url=https://github.com/Yanksi/mem-worker)
 
-The `YOUR_ORG` URL is a placeholder. This button does not automatically provision the D1 database, Vectorize index, Queue, metadata indexes, or secrets described below.
+Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The deploy button does not automatically provision the D1 database, Vectorize index, Queue, metadata indexes, or secrets described below.
 
 ## Included
 
