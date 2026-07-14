@@ -5,7 +5,7 @@ compatibility_date = "2026-07-14"
 [[d1_databases]]
 binding = "DB"
 database_name = "mem0-edge"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "f477a9e5-2f2c-4821-8ea7-0f11fb8ace2a"
 migrations_dir = "src/migrations"
 
 [[vectorize]]
@@ -20,9 +20,9 @@ queue = "mem0-edge-memory-jobs"
 queue = "mem0-edge-memory-jobs"
 
 [vars]
-EMBEDDING_MODEL = "text-embedding-3-small"
-LLM_MODEL = "gpt-4o-mini"
-LLM_API_BASE_URL = "https://api.openai.com/v1"
-EMBEDDING_API_BASE_URL = "https://api.openai.com/v1"
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
+LLM_MODEL = "openai/gpt-4o-mini"
+LLM_API_BASE_URL = "https://openrouter.ai/api/v1"
+EMBEDDING_API_BASE_URL = "https://openrouter.ai/api/v1"
 VECTOR_DIMENSIONS = "1536"
 MEM0_INDEX_NAME = "mem0-edge"
