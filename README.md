@@ -120,10 +120,15 @@ Create `.dev.vars` (do not commit it):
 OPENAI_API_KEY=replace-me
 MEM0_API_KEY=replace-with-a-long-random-api-key
 DASHBOARD_PASSWORD=replace-with-a-strong-dashboard-password
+```
+
+Models and endpoints are normal Worker variables, not secrets. Set their deployed values in the Cloudflare dashboard under **Workers & Pages > your Worker > Settings > Variables and Secrets**, or change the defaults in `wrangler.toml`:
+
+```toml
 LLM_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
 LLM_API_BASE_URL=https://api.openai.com/v1
-# Optional: defaults to LLM_API_BASE_URL.
+# Optional: an empty value falls back to LLM_API_BASE_URL.
 EMBEDDING_API_BASE_URL=
 ```
 

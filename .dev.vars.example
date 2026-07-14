@@ -1,8 +1,3 @@
 OPENAI_API_KEY=
 MEM0_API_KEY=
 DASHBOARD_PASSWORD=
-LLM_MODEL=gpt-4o-mini
-EMBEDDING_MODEL=text-embedding-3-small
-LLM_API_BASE_URL=https://api.openai.com/v1
-# Optional: defaults to LLM_API_BASE_URL when omitted.
-EMBEDDING_API_BASE_URL=
