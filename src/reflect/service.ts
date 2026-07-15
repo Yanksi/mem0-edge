@@ -14,6 +14,7 @@ export const REFLECT_MAX_ENTITIES = 24;
 export const REFLECT_MAX_EDGES = 32;
 export const REFLECT_MAX_EVIDENCE = 20;
 export const REFLECT_MAX_EVIDENCE_CHARS = 24_000;
+export const REFLECT_MEMORY_QUERY_CHUNK_SIZE = 90;
 
 export interface ReflectResult {
   result: string;
@@ -166,10 +167,20 @@ async function collectEvidenceCandidates(
 async function loadActiveMemories(db: ReturnType<typeof createDb>, userId: string, ids: string[]): Promise<MemoryResponse[]> {
   const evidenceIds = uniqueSorted(ids);
   if (evidenceIds.length === 0) return [];
-  const rows = await db.select().from(memories).where(and(
-    inArray(memories.id, evidenceIds), eq(memories.userId, userId), isNull(memories.deletedAt),
-  )).all();
-  return rows.map(toMemoryResponse);
+  const rowsById = new Map<string, typeof memories.$inferSelect>();
+  for (let offset = 0; offset < evidenceIds.length && rowsById.size < REFLECT_MAX_EVIDENCE; offset += REFLECT_MEMORY_QUERY_CHUNK_SIZE) {
+    const chunk = evidenceIds.slice(offset, offset + REFLECT_MEMORY_QUERY_CHUNK_SIZE);
+    const rows = await db.select().from(memories).where(and(
+      inArray(memories.id, chunk), eq(memories.userId, userId), isNull(memories.deletedAt),
+    )).all();
+    for (const row of rows) {
+      if (chunk.includes(row.id) && row.userId === userId && row.deletedAt === null) rowsById.set(row.id, row);
+    }
+  }
+  return evidenceIds.flatMap((id) => {
+    const row = rowsById.get(id);
+    return row === undefined ? [] : [toMemoryResponse(row)];
+  }).slice(0, REFLECT_MAX_EVIDENCE);
 }
 
 export function boundedEvidenceCandidates(seeds: MemoryResponse[], graphMemories: MemoryResponse[]): MemoryResponse[] {

@@ -25,6 +25,14 @@ reflectRoutes.post('/', async (context) => {
     return context.json(await reflectMemories(context.env, request, requestId));
   } catch (error) {
     event = 'reflect.failed';
+    console.error(JSON.stringify({
+      event: 'reflect.error',
+      request_id: requestId,
+      user_id: request.user_id,
+      agent_id: request.agent_id,
+      error_name: error instanceof Error ? error.name : 'UnknownError',
+      error_message: error instanceof Error ? error.message : String(error),
+    }));
     if (error instanceof GraphLlmConfigurationError) {
       return context.json({ error: 'Graph reflection is not configured' }, 503);
     }

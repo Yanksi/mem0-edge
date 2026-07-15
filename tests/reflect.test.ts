@@ -45,12 +45,14 @@ const memoryRows = [
 ];
 
 let relationshipPredicates: unknown[] = [];
+let memoryPredicates: unknown[] = [];
 let seedLinks = [{ memoryId: 'memory-ada', entityId: 'entity-ada' }];
 
 function createReadOnlyDb() {
   const where = vi.fn((predicate: unknown) => ({ all: vi.fn().mockResolvedValue(rowsFor(predicate)) }));
   const from = vi.fn((table: unknown) => ({ where: (predicate: unknown) => {
     if (table === relationships) relationshipPredicates.push(predicate);
+    if (table === memories) memoryPredicates.push(predicate);
     return { all: vi.fn().mockResolvedValue(rowsFor(predicate, table)) };
   } }));
   const select = vi.fn(() => ({ from }));
@@ -76,6 +78,7 @@ describe('reflectMemories', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     relationshipPredicates = [];
+    memoryPredicates = [];
     seedLinks = [{ memoryId: 'memory-ada', entityId: 'entity-ada' }];
     dependencies.createDb.mockReturnValue(createReadOnlyDb().db);
     dependencies.searchMemories.mockResolvedValue([{ id: 'memory-ada', memory: 'Ada reports to Benoit.', user_id: 'user-a', metadata: {}, created_at: '2026-07-15T00:00:00.000Z', updated_at: '2026-07-15T00:00:00.000Z' }]);
@@ -132,6 +135,19 @@ describe('reflectMemories', () => {
       expect(containsValue(predicate, relationships.userId)).toBe(true);
       expect(containsValue(predicate, 'user-a')).toBe(true);
     }
+  });
+
+  it('chunks large graph evidence lookups below the D1 bound-parameter limit', async () => {
+    seedLinks = Array.from({ length: 120 }, (_, index) => ({
+      memoryId: `bulk-memory-${String(index + 1).padStart(3, '0')}`,
+      entityId: 'entity-ada',
+    }));
+
+    await reflectMemories(env, {
+      query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a',
+    }, 'request-large-evidence');
+
+    expect(memoryPredicates).toHaveLength(2);
   });
 
   it('returns a static high-uncertainty response without D1 or model access when semantic search has no seeds', async () => {
