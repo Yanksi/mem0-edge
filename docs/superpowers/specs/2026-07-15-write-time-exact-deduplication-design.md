@@ -13,6 +13,10 @@ This design does not perform semantic deduplication. Two memories are duplicates
 only when their final stored `content`, `user_id`, and `agent_id` are equal,
 including null ownership fields.
 
+Each memory also stores `content_hash`, the lowercase hexadecimal SHA-256 digest
+of its final stored content. The existing `hash` column remains the originating
+request/idempotency hash and is not reused for this purpose.
+
 ## Scope Identity
 
 Exact-text uniqueness uses the complete memory ownership scope:
@@ -42,21 +46,27 @@ Existing path-specific behavior remains intact:
 
 Deduplication introduces no additional normalization.
 
+`content_hash` is an indexed lookup accelerator, not the final equality
+authority. Queries match both the digest and original content, so even a
+theoretical digest collision does not merge distinct memories.
+
 ## Database Enforcement
 
-Migration `0007` adds three partial unique indexes:
+The schema adds a required `content_hash` column and three partial unique
+indexes. Scope and the fixed-size digest form the selective index prefix; raw
+content is the final collision-safe key component:
 
 ```sql
 CREATE UNIQUE INDEX memories_active_user_agent_content_idx
-  ON memories (user_id, agent_id, content)
+  ON memories (user_id, agent_id, content_hash, content)
   WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NOT NULL;
 
 CREATE UNIQUE INDEX memories_active_user_content_idx
-  ON memories (user_id, content)
+  ON memories (user_id, content_hash, content)
   WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NULL;
 
 CREATE UNIQUE INDEX memories_active_agent_content_idx
-  ON memories (agent_id, content)
+  ON memories (agent_id, content_hash, content)
   WHERE deleted_at IS NULL AND user_id IS NULL AND agent_id IS NOT NULL;
 ```
 
@@ -73,13 +83,15 @@ that could reject legacy data unrelated to deduplication.
 Memory creation paths use a shared exact-match lookup and insertion contract.
 For each unique candidate:
 
-1. Query for an active row with the same complete ownership scope and content.
-2. If found, return that canonical memory without embedding, adding history, or
+1. Compute SHA-256 once from the final stored content.
+2. Query for an active row with the same complete ownership scope,
+   `content_hash`, and content.
+3. If found, return that canonical memory without embedding, adding history, or
    persisting extracted graph data.
-3. If not found, embed and upsert the candidate vector, then attempt the memory
+4. If not found, embed and upsert the candidate vector, then attempt the memory
    insert with conflict-safe returning semantics.
-4. If the insert wins, append history and persist graph data as today.
-5. If the insert loses to a concurrent writer, fetch and return the canonical
+5. If the insert wins, append history and persist graph data as today.
+6. If the insert loses to a concurrent writer, fetch and return the canonical
    row. Delete the losing candidate's Vectorize ID when it differs from the
    canonical ID.
 
@@ -113,10 +125,22 @@ memory or vector.
 
 ## Existing Production Cleanup
 
-Before migration `0007` is applied, pause Hermes writers and allow the memory
-Queue backlog to drain. Compute duplicate groups by
-`(user_id, agent_id, content)` over active rows. Keep the row ordered first by
-`created_at ASC, id ASC`; every other row is a loser.
+Adding a non-null digest to existing rows requires a two-phase schema rollout:
+
+1. migration `0007` adds nullable `content_hash` without uniqueness;
+2. an intermediate Worker deployment writes `content_hash` on every new memory;
+3. after writers are paused and the Queue is drained, a repository maintenance
+   command pages through all existing rows, computes SHA-256 locally, and
+   backfills D1 in bounded batches;
+4. the same command computes duplicate groups by
+   `(user_id, agent_id, content_hash, content)` over active rows;
+5. after cleanup and verification, migration `0008` rebuilds the column as
+   `NOT NULL` and creates the three unique partial indexes.
+
+The maintenance command must be resumable: updating an already-correct digest
+and reapplying the same loser mapping are no-ops. Keep the active row ordered
+first by `created_at ASC, id ASC`; every other row in a duplicate group is a
+loser.
 
 For each loser-to-canonical mapping, one-time cleanup must:
 
@@ -129,8 +153,8 @@ For each loser-to-canonical mapping, one-time cleanup must:
 D1 changes are applied transactionally before vector deletion. If Vectorize
 cleanup is interrupted, stale vectors cannot produce active results because the
 corresponding D1 rows are already soft-deleted; rerunning deletion is safe. Do
-not apply the unique indexes until a verification query reports zero active
-duplicate groups.
+not apply migration `0008` until verification reports zero null or mismatched
+content hashes and zero active duplicate groups.
 
 The cleanup does not delete memory history, entities, relationships, or entity
 vectors. It preserves graph evidence by moving memory references to the
@@ -154,6 +178,8 @@ agent reclassification remain unchanged.
 
 - Database uniqueness conflicts are expected concurrency outcomes, not request
   failures.
+- A stored digest is always computed from final content by the Worker; callers
+  cannot provide or override it.
 - A losing vector cleanup failure is transient and leaves the durable request
   retryable.
 - Embedding or Vectorize failure before a successful insert creates no active
@@ -166,7 +192,9 @@ agent reclassification remain unchanged.
 
 Automated coverage must include:
 
-- all three partial unique indexes and soft-delete exclusion;
+- content-hash generation for verbatim imports and normalized API candidates;
+- backfill resumption and detection of null or mismatched hashes;
+- all three digest-prefixed partial unique indexes and soft-delete exclusion;
 - identical user-agent scope returns one active memory;
 - same text under a different user or agent remains distinct;
 - user-only and agent-only scope behavior;
@@ -184,16 +212,18 @@ Automated coverage must include:
 
 ## Deployment Sequence
 
-1. Verify tests and prepare migration `0007` without applying it.
-2. Pause Hermes writes and drain Queue work.
-3. Export and verify the deterministic production duplicate mapping.
-4. Apply D1 graph-preserving soft deletion and remove loser vectors.
-5. Confirm zero active duplicate groups and no loser vectors.
-6. Apply migration `0007`.
-7. Deploy shared write-time deduplication and Dashboard removal.
-8. Run scope, soft-delete recreation, synchronous add, queued add, and import
+1. Verify tests and prepare migrations `0007` and `0008` plus the resumable
+   maintenance command.
+2. Apply migration `0007` and deploy intermediate dual-write code.
+3. Pause Hermes writes and drain Queue work.
+4. Backfill hashes and export the deterministic production duplicate mapping.
+5. Apply D1 graph-preserving soft deletion and remove loser vectors.
+6. Confirm zero null/mismatched hashes, duplicate groups, and loser vectors.
+7. Apply migration `0008`.
+8. Deploy final shared write-time deduplication and Dashboard removal.
+9. Run scope, soft-delete recreation, synchronous add, queued add, and import
    probes; clean up probe records.
-9. Resume Hermes writes.
+10. Resume Hermes writes.
 
 ## Explicitly Not Included
 
