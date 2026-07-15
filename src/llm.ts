@@ -149,7 +149,8 @@ export async function reflectWithGraphModel(env: Env, input: GraphReflectionInpu
       signal: AbortSignal.timeout(20_000),
       body: JSON.stringify({
         model: configuration.model,
-        response_format: { type: 'json_object' },
+        provider: { require_parameters: true },
+        response_format: graphReflectionResponseFormat(parsedInput.data),
         reasoning: configuration.thinkingLevel === 'disabled'
           ? { enabled: false }
           : { effort: configuration.thinkingLevel },
@@ -166,7 +167,7 @@ export async function reflectWithGraphModel(env: Env, input: GraphReflectionInpu
       }),
     });
   } catch (error) {
-    throw new Error(`Graph LLM reflection request failed: ${errorMessage(error)}`);
+    throw new UpstreamServiceError(`Graph LLM reflection request failed: ${errorMessage(error)}`, 502);
   }
 
   if (!response.ok) {
@@ -204,7 +205,39 @@ export async function reflectWithGraphModel(env: Env, input: GraphReflectionInpu
 }
 
 function invalidGraphReflectionResult(): Error {
-  return new Error('Graph LLM reflection response contained an invalid result');
+  return new UpstreamServiceError('Graph LLM reflection response contained an invalid result', 502);
+}
+
+function graphReflectionResponseFormat(input: GraphReflectionInput): {
+  type: 'json_schema';
+  json_schema: {
+    name: string;
+    strict: true;
+    schema: Record<string, unknown>;
+  };
+} {
+  const relationRefs = input.relations.map(({ ref }) => ref);
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: 'graph_reflection_result',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: {
+          result: { type: 'string' },
+          evidence_relation_refs: {
+            type: 'array',
+            items: relationRefs.length === 0
+              ? { type: 'string' }
+              : { type: 'string', enum: relationRefs },
+          },
+        },
+        required: ['result', 'evidence_relation_refs'],
+        additionalProperties: false,
+      },
+    },
+  };
 }
 
 function errorMessage(error: unknown): string {

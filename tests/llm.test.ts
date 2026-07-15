@@ -201,6 +201,26 @@ describe('reflectWithGraphModel', () => {
     GRAPH_LLM_API_KEY: 'graph-key',
   };
 
+  const strictGraphResponseFormat = {
+    type: 'json_schema',
+    json_schema: {
+      name: 'graph_reflection_result',
+      strict: true,
+      schema: {
+        type: 'object',
+        properties: {
+          result: { type: 'string' },
+          evidence_relation_refs: {
+            type: 'array',
+            items: { type: 'string', enum: ['R1', 'R2'] },
+          },
+        },
+        required: ['result', 'evidence_relation_refs'],
+        additionalProperties: false,
+      },
+    },
+  };
+
   it('uses only configured graph credentials, model, endpoint, and default low reasoning', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({
@@ -227,7 +247,8 @@ describe('reflectWithGraphModel', () => {
     );
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       model: 'graph-reasoner',
-      response_format: { type: 'json_object' },
+      provider: { require_parameters: true },
+      response_format: strictGraphResponseFormat,
       reasoning: { effort: 'low' },
       messages: [
         { role: 'system', content: GRAPH_REFLECTION_INSTRUCTION },
@@ -262,7 +283,8 @@ describe('reflectWithGraphModel', () => {
     const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(payload).toEqual({
       model: 'graph-reasoner',
-      response_format: { type: 'json_object' },
+      provider: { require_parameters: true },
+      response_format: strictGraphResponseFormat,
       reasoning: { effort: 'high' },
       messages: [
         { role: 'system', content: GRAPH_REFLECTION_INSTRUCTION },
@@ -284,7 +306,8 @@ describe('reflectWithGraphModel', () => {
     const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(payload).toEqual({
       model: 'graph-reasoner',
-      response_format: { type: 'json_object' },
+      provider: { require_parameters: true },
+      response_format: strictGraphResponseFormat,
       reasoning: { enabled: false },
       messages: [
         { role: 'system', content: GRAPH_REFLECTION_INSTRUCTION },
@@ -310,7 +333,8 @@ describe('reflectWithGraphModel', () => {
     expect(fetchMock).toHaveBeenCalledWith('https://openrouter.ai/api/v1/chat/completions', expect.anything());
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       model: 'graph-reasoner',
-      response_format: { type: 'json_object' },
+      provider: { require_parameters: true },
+      response_format: strictGraphResponseFormat,
       reasoning: { effort: 'medium' },
       messages: [
         { role: 'system', content: GRAPH_REFLECTION_INSTRUCTION },
@@ -331,6 +355,14 @@ describe('reflectWithGraphModel', () => {
 
     expect(timeoutSpy).toHaveBeenCalledWith(20_000);
     timeoutSpy.mockRestore();
+  });
+
+  it('classifies graph provider transport failures as upstream failures', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new DOMException('timed out', 'TimeoutError')));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toMatchObject({
+      name: 'UpstreamServiceError', status: 502,
+    } satisfies Partial<UpstreamServiceError>);
   });
 
   it.each([
@@ -415,14 +447,19 @@ describe('reflectWithGraphModel', () => {
       entities: [{ ref: 'E1', name: 'Ada', type: 'person' }],
       relations: [],
     };
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+    const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
         result: 'This cannot be confirmed from the supplied relations.', evidence_relation_refs: [],
       }) } }] }), { status: 200 }),
-    ));
+    );
+    vi.stubGlobal('fetch', fetchMock);
 
     await expect(reflectWithGraphModel(graphEnv, edgelessInput)).resolves.toEqual({
       result: 'This cannot be confirmed from the supplied relations.', evidence_relation_refs: [],
+    });
+    const schema = JSON.parse(fetchMock.mock.calls[0][1].body).response_format.json_schema.schema;
+    expect(schema.properties.evidence_relation_refs).toEqual({
+      type: 'array', items: { type: 'string' },
     });
   });
 
