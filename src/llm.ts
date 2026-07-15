@@ -151,9 +151,7 @@ export async function reflectWithGraphModel(env: Env, input: GraphReflectionInpu
         model: configuration.model,
         response_format: { type: 'json_object' },
         ...(configuration.thinkingLevel === 'disabled' ? {} : { reasoning_effort: configuration.thinkingLevel }),
-        ...(configuration.thinkingLevel !== 'disabled' && isDeepSeekEndpoint(configuration.baseUrl)
-          ? { thinking: { type: 'enabled' } }
-          : {}),
+        ...(configuration.thinkingLevel === 'disabled' ? {} : { thinking: { type: 'enabled' } }),
         messages: [
           {
             role: 'system',
@@ -247,14 +245,6 @@ function graphLlmConfiguration(env: Env): {
     model: env.GRAPH_LLM_MODEL!.trim(),
     thinkingLevel: thinking.data,
   };
-}
-
-function isDeepSeekEndpoint(baseUrl: string): boolean {
-  try {
-    return new URL(baseUrl).hostname.toLowerCase() === 'api.deepseek.com';
-  } catch {
-    return false;
-  }
 }
 
 function normalizeBaseUrl(value: string): string {
