@@ -2,6 +2,13 @@ name = "mem0-edge"
 main = "src/index.ts"
 compatibility_date = "2026-07-14"
 
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "mem0-edge"
