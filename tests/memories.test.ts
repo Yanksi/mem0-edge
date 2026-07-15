@@ -7,6 +7,9 @@ const dependencies = vi.hoisted(() => ({
   embedText: vi.fn(),
   extractMemories: vi.fn(),
   upsertVectors: vi.fn(),
+  upsertEntityVectors: vi.fn(),
+  searchVectors: vi.fn(),
+  searchEntityVectors: vi.fn(),
 }));
 
 vi.mock('../src/db/client', () => ({ createDb: dependencies.createDb }));
@@ -17,6 +20,9 @@ vi.mock('../src/llm', () => ({
 vi.mock('../src/vectorize', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/vectorize')>(),
   upsertVectors: dependencies.upsertVectors,
+  upsertEntityVectors: dependencies.upsertEntityVectors,
+  searchVectors: dependencies.searchVectors,
+  searchEntityVectors: dependencies.searchEntityVectors,
 }));
 
 const service = vi.hoisted(() => ({
@@ -161,6 +167,7 @@ describe('addMemory idempotency ledger', () => {
     dependencies.extractMemories.mockResolvedValue([{ memory: 'User lives in Zurich.' }]);
     dependencies.embedText.mockResolvedValue([0.1, 0.2]);
     dependencies.upsertVectors.mockResolvedValue(undefined);
+    dependencies.upsertEntityVectors.mockResolvedValue(undefined);
     const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
 
     await actual.addMemory(env, addRequest);
@@ -317,6 +324,16 @@ describe('addMemory idempotency ledger', () => {
     expect(entityRows.every((row) => row.userId === 'user-123')).toBe(true);
     expect(linkRows).toHaveLength(2);
     expect(relationshipRows).toEqual([expect.objectContaining({ userId: 'user-123', relationType: 'works_at', confidence: 0.9 })]);
+    expect(dependencies.upsertEntityVectors).toHaveBeenCalledWith(
+      env.ENTITY_VECTORIZE,
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: expect.any(String),
+          values: [0.1, 0.2],
+          metadata: expect.objectContaining({ user_id: 'user-123', entity: 'ada' }),
+        }),
+      ]),
+    );
   });
 
   it('does not persist graph rows when inference is disabled', async () => {
@@ -331,6 +348,77 @@ describe('addMemory idempotency ledger', () => {
     expect(db.insert).not.toHaveBeenCalledWith(entities);
     expect(db.insert).not.toHaveBeenCalledWith(memoryEntityLinks);
     expect(db.insert).not.toHaveBeenCalledWith(relationships);
+    expect(dependencies.upsertEntityVectors).not.toHaveBeenCalled();
+  });
+});
+
+describe('user-scoped entity-linked search', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('boosts only semantic candidates linked to matching entities', async () => {
+    const semanticRows = [
+      { id: 'semantic-first', content: 'Other memory', userId: 'user-123', agentId: null, runId: null, actorId: null, metadataJson: '{}', hash: 'a', createdAt: 1, updatedAt: 1, deletedAt: null },
+      { id: 'entity-linked', content: 'Ada works at Acme', userId: 'user-123', agentId: null, runId: null, actorId: null, metadataJson: '{}', hash: 'b', createdAt: 1, updatedAt: 1, deletedAt: null },
+    ];
+    const db = {
+      select: vi.fn(() => ({
+        from: vi.fn((table: unknown) => ({
+          where: vi.fn().mockReturnValue(table === memories
+            ? { all: vi.fn().mockResolvedValue(semanticRows) }
+            : { all: vi.fn().mockResolvedValue([
+              { memoryId: 'entity-linked', entityId: 'entity-ada' },
+              { memoryId: 'outside-pool', entityId: 'entity-ada' },
+            ]) }),
+        })),
+      })),
+    };
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.embedText.mockResolvedValue([0.1, 0.2]);
+    dependencies.searchVectors.mockResolvedValue([
+      { id: 'semantic-first', score: 0.9 },
+      { id: 'entity-linked', score: 0.84 },
+    ]);
+    dependencies.searchEntityVectors.mockResolvedValue([{ id: 'entity-ada', score: 1 }]);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    const results = await actual.searchMemories(env, { query: 'Where does Ada work?', user_id: 'user-123', filters: {}, limit: 2 });
+
+    expect(dependencies.embedText).toHaveBeenCalledOnce();
+    expect(dependencies.searchVectors).toHaveBeenCalledWith(env.VECTORIZE, [0.1, 0.2], expect.anything(), { candidatePool: 50 });
+    expect(dependencies.searchEntityVectors).toHaveBeenCalledWith(env.ENTITY_VECTORIZE, [0.1, 0.2], 'user-123');
+    expect(results.map(({ id }) => id)).toEqual(['entity-linked', 'semantic-first']);
+    expect(results.map(({ id }) => id)).not.toContain('outside-pool');
+  });
+
+  it('preserves semantic score order when no entity links match', async () => {
+    const rows = [
+      { id: 'a', content: 'First', userId: 'user-123', agentId: null, runId: null, actorId: null, metadataJson: '{}', hash: 'a', createdAt: 1, updatedAt: 1, deletedAt: null },
+      { id: 'b', content: 'Second', userId: 'user-123', agentId: null, runId: null, actorId: null, metadataJson: '{}', hash: 'b', createdAt: 1, updatedAt: 1, deletedAt: null },
+    ];
+    dependencies.createDb.mockReturnValue({ select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn().mockReturnValue({ all: vi.fn().mockResolvedValue(rows) }) })) })) });
+    dependencies.embedText.mockResolvedValue([0.1, 0.2]);
+    dependencies.searchVectors.mockResolvedValue([{ id: 'a', score: 0.9 }, { id: 'b', score: 0.8 }]);
+    dependencies.searchEntityVectors.mockResolvedValue([]);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await expect(actual.searchMemories(env, { query: 'query', user_id: 'user-123', filters: {}, limit: 2 }))
+      .resolves.toMatchObject([{ id: 'a', score: 0.9 }, { id: 'b', score: 0.8 }]);
+  });
+
+  it('keeps agent-scoped search semantic-only', async () => {
+    const row = { id: 'agent-memory', content: 'Agent note', userId: null, agentId: 'agent-123', runId: null, actorId: null, metadataJson: '{}', hash: 'a', createdAt: 1, updatedAt: 1, deletedAt: null };
+    dependencies.createDb.mockReturnValue({ select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn().mockReturnValue({ all: vi.fn().mockResolvedValue([row]) }) })) })) });
+    dependencies.embedText.mockResolvedValue([0.1, 0.2]);
+    dependencies.searchVectors.mockResolvedValue([{ id: 'agent-memory', score: 0.9 }]);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await expect(actual.searchMemories(env, { query: 'query', agent_id: 'agent-123', filters: {}, limit: 1 }))
+      .resolves.toMatchObject([{ id: 'agent-memory', score: 0.9 }]);
+
+    expect(dependencies.searchVectors).toHaveBeenCalledWith(env.VECTORIZE, [0.1, 0.2], expect.anything());
+    expect(dependencies.searchEntityVectors).not.toHaveBeenCalled();
   });
 });
 

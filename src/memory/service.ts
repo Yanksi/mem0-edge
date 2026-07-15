@@ -5,7 +5,7 @@ import { entities, memories, memoryEntityLinks, memoryHistory, memoryRequests, r
 import type { Env, MemoryJob } from '../env';
 import { embedText, extractMemories } from '../llm';
 import type { ExtractedEntity, ExtractedMemory, ExtractedRelationship } from '../llm';
-import { deleteVector, searchVectors, upsertVectors } from '../vectorize';
+import { deleteVector, searchEntityVectors, searchVectors, upsertEntityVectors, upsertVectors } from '../vectorize';
 import { buildIdempotencyKey, sha256Hex } from './idempotency';
 import { AddMemoryRequestSchema, MemoryResponseSchema } from './types';
 import type {
@@ -24,6 +24,7 @@ type LeaseClaim = LedgerClaim;
 type MemoryCandidate = { content: string; extracted?: ExtractedMemory };
 
 const PROCESSING_LEASE_MS = 5 * 60 * 1000;
+const ENTITY_MATCH_BOOST = 0.1;
 
 export class TransientMemoryJobError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -298,7 +299,7 @@ async function createMemoriesForLease(
     await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: vectorMetadata(row) }]);
     await db.insert(memories).values(row).onConflictDoNothing().run();
     await appendHistory(db, row, 'created', await deterministicCreatedHistoryId(id));
-    if (candidate.extracted !== undefined) await persistExtractedGraph(db, row, candidate.extracted);
+    if (candidate.extracted !== undefined) await persistExtractedGraph(db, env, row, candidate.extracted);
     responses.push(toResponse(row));
   }
 
@@ -358,13 +359,14 @@ async function candidatesForLease(db: ReturnType<typeof createDb>, env: Env, req
   return rows.length === 0 ? undefined : nonEmpty;
 }
 
-async function persistExtractedGraph(db: ReturnType<typeof createDb>, memory: MemoryRow, extracted: ExtractedMemory): Promise<void> {
+async function persistExtractedGraph(db: ReturnType<typeof createDb>, env: Env, memory: MemoryRow, extracted: ExtractedMemory): Promise<void> {
   if (memory.userId === null) return;
   const byName = new Map<string, { id: string; name: string; type: string }>();
   for (const entity of extracted.entities ?? []) {
     const resolved = await persistEntity(db, memory.userId, entity.name, entity.type, entity.summary);
     byName.set(normalizeEntityName(entity.name), resolved);
     await db.insert(memoryEntityLinks).values({ memoryId: memory.id, entityId: resolved.id, createdAt: unixNow() }).onConflictDoNothing().run();
+    await persistEntityVector(env, memory.userId, resolved);
   }
   for (const relationship of extracted.relationships ?? []) {
     const sourceKey = normalizeEntityName(relationship.source);
@@ -374,12 +376,14 @@ async function persistExtractedGraph(db: ReturnType<typeof createDb>, memory: Me
       source = await persistEntity(db, memory.userId, relationship.source);
       byName.set(sourceKey, source);
       await db.insert(memoryEntityLinks).values({ memoryId: memory.id, entityId: source.id, createdAt: unixNow() }).onConflictDoNothing().run();
+      await persistEntityVector(env, memory.userId, source);
     }
     let target = byName.get(targetKey);
     if (target === undefined) {
       target = await persistEntity(db, memory.userId, relationship.target);
       byName.set(targetKey, target);
       await db.insert(memoryEntityLinks).values({ memoryId: memory.id, entityId: target.id, createdAt: unixNow() }).onConflictDoNothing().run();
+      await persistEntityVector(env, memory.userId, target);
     }
     const relationType = relationship.relation_type.trim();
     if (!relationType) continue;
@@ -391,6 +395,20 @@ async function persistExtractedGraph(db: ReturnType<typeof createDb>, memory: Me
       metadataJson: '{}', createdAt: now, updatedAt: now,
     }).onConflictDoNothing().run();
   }
+}
+
+async function persistEntityVector(
+  env: Env,
+  userId: string,
+  entity: { id: string; name: string; type: string },
+): Promise<void> {
+  const name = normalizeEntityName(entity.name);
+  const values = await embedText(env, name);
+  await upsertEntityVectors(env.ENTITY_VECTORIZE, [{
+    id: entity.id,
+    values,
+    metadata: { user_id: userId, entity: name, entity_type: entity.type },
+  }]);
 }
 
 async function persistEntity(db: ReturnType<typeof createDb>, userId: string, name: string, type = 'entity', summary?: string): Promise<{ id: string; name: string; type: string }> {
@@ -473,12 +491,47 @@ function parseCachedResults(value: string | null): MemoryResponse[] | undefined 
 }
 
 export async function searchMemories(env: Env, request: SearchMemoryRequest): Promise<MemoryResponse[]> {
-  const matches = await searchVectors(env.VECTORIZE, await embedText(env, request.query), request);
+  const vector = await embedText(env, request.query);
+  if (request.user_id === undefined) {
+    return searchSemanticMemories(env, request, vector);
+  }
+
+  const [matches, entityMatches] = await Promise.all([
+    searchVectors(env.VECTORIZE, vector, request, { candidatePool: 50 }),
+    searchEntityVectors(env.ENTITY_VECTORIZE, vector, request.user_id),
+  ]);
+  if (matches.length === 0) return [];
+
+  const db = createDb(env.DB);
+  const [rows, links] = await Promise.all([
+    db.select().from(memories).where(and(
+    inArray(memories.id, matches.map(({ id }) => id)),
+    eq(memories.userId, request.user_id),
+    isNull(memories.deletedAt),
+    )).all(),
+    linkedMemoryIds(db, entityMatches.map(({ id }) => id)),
+  ]);
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const entityScores = new Map(entityMatches.map(({ id, score }) => [id, normalizeEntityScore(score)]));
+  const linkedScores = new Map<string, number>();
+  for (const link of links) {
+    const score = entityScores.get(link.entityId);
+    if (score !== undefined) linkedScores.set(link.memoryId, Math.max(linkedScores.get(link.memoryId) ?? 0, score));
+  }
+
+  return matches.flatMap(({ id, score }) => {
+    const row = byId.get(id);
+    return row === undefined ? [] : [{ ...toResponse(row), score: score + ENTITY_MATCH_BOOST * (linkedScores.get(id) ?? 0) }];
+  }).sort((left, right) => right.score - left.score || left.id.localeCompare(right.id)).slice(0, request.limit);
+}
+
+async function searchSemanticMemories(env: Env, request: SearchMemoryRequest, vector: number[]): Promise<MemoryResponse[]> {
+  const matches = await searchVectors(env.VECTORIZE, vector, request);
   if (matches.length === 0) return [];
 
   const rows = await createDb(env.DB).select().from(memories).where(and(
     inArray(memories.id, matches.map(({ id }) => id)),
-    ...(request.user_id === undefined ? [eq(memories.agentId, request.agent_id!)] : [eq(memories.userId, request.user_id)]),
+    eq(memories.agentId, request.agent_id!),
     isNull(memories.deletedAt),
   )).all();
   const byId = new Map(rows.map((row) => [row.id, row]));
@@ -486,6 +539,21 @@ export async function searchMemories(env: Env, request: SearchMemoryRequest): Pr
     const row = byId.get(id);
     return row === undefined ? [] : [{ ...toResponse(row), score }];
   });
+}
+
+async function linkedMemoryIds(
+  db: ReturnType<typeof createDb>,
+  entityIds: string[],
+): Promise<Array<{ memoryId: string; entityId: string }>> {
+  if (entityIds.length === 0) return [];
+  return db.select({ memoryId: memoryEntityLinks.memoryId, entityId: memoryEntityLinks.entityId })
+    .from(memoryEntityLinks)
+    .where(inArray(memoryEntityLinks.entityId, entityIds))
+    .all();
+}
+
+function normalizeEntityScore(score: number): number {
+  return Math.min(Math.max(score, 0), 1);
 }
 
 export async function getMemory(env: Env, id: string, userId: string): Promise<MemoryResponse | null> {
