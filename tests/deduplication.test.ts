@@ -118,6 +118,62 @@ describe('findActiveExactMemory', () => {
     ).bind('memory-null-hash').first()).resolves.toEqual({ content_hash: digest });
   });
 
+  it.each([
+    ['deleted', 'UPDATE memories SET deleted_at = ? WHERE id = ?', { deleted_at: 12 }],
+    ['moved to another owner', 'UPDATE memories SET user_id = ? WHERE id = ?', { user_id: 'user-2' }],
+    ['changed to different content', 'UPDATE memories SET content = ? WHERE id = ?', { content: 'Changed concurrently' }],
+  ] as const)('does not return a phase-one row that is %s before backfill', async (_label, sql, changed) => {
+    const content = 'The launch date is October 8.';
+    const digest = await contentHash(content);
+    await seedMemory({
+      id: 'memory-raced',
+      content,
+      userId: 'user-1',
+      agentId: null,
+      contentHash: null,
+    });
+    const racedEnv = withMutationBeforeBackfill(async () => {
+      const value = Object.values(changed)[0];
+      await env.DB.prepare(sql).bind(value, 'memory-raced').run();
+    });
+
+    await expect(findActiveExactMemory(
+      racedEnv,
+      { userId: 'user-1', agentId: null },
+      content,
+      digest,
+    )).resolves.toBeUndefined();
+    await expect(env.DB.prepare(
+      'SELECT content_hash FROM memories WHERE id = ?',
+    ).bind('memory-raced').first()).resolves.toEqual({ content_hash: null });
+  });
+
+  it('does not overwrite or return a concurrently populated different digest', async () => {
+    const content = 'The launch date is October 8.';
+    const digest = await contentHash(content);
+    await seedMemory({
+      id: 'memory-raced',
+      content,
+      userId: 'user-1',
+      contentHash: null,
+    });
+    const racedEnv = withMutationBeforeBackfill(async () => {
+      await env.DB.prepare(
+        'UPDATE memories SET content_hash = ? WHERE id = ?',
+      ).bind('different-digest', 'memory-raced').run();
+    });
+
+    await expect(findActiveExactMemory(
+      racedEnv,
+      { userId: 'user-1', agentId: null },
+      content,
+      digest,
+    )).resolves.toBeUndefined();
+    await expect(env.DB.prepare(
+      'SELECT content_hash FROM memories WHERE id = ?',
+    ).bind('memory-raced').first()).resolves.toEqual({ content_hash: 'different-digest' });
+  });
+
   it('honors exclusions, active state, raw equality, and null/value ownership semantics', async () => {
     const content = 'The office is in Zurich.';
     const digest = await contentHash(content);
@@ -395,4 +451,35 @@ async function memoryById(id: string): Promise<MemoryRow | undefined> {
   `).bind(id).first<MemoryRow>();
 
   return row ?? undefined;
+}
+
+function withMutationBeforeBackfill(mutate: () => Promise<void>): Env {
+  const database = env.DB;
+  let mutationPending = true;
+  const wrappedDatabase = {
+    prepare(query: string) {
+      const statement = database.prepare(query);
+      if (!query.startsWith('update "memories" set "content_hash"')) {
+        return statement;
+      }
+
+      let values: unknown[] = [];
+      const wrappedStatement = {
+        bind(...bindings: unknown[]) {
+          values = bindings;
+          return wrappedStatement;
+        },
+        async raw<T>() {
+          if (mutationPending) {
+            mutationPending = false;
+            await mutate();
+          }
+          return statement.bind(...values).raw<T>();
+        },
+      };
+      return wrappedStatement as unknown as D1PreparedStatement;
+    },
+  } as unknown as D1Database;
+
+  return { ...env, DB: wrappedDatabase };
 }

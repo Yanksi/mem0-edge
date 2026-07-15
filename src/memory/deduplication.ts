@@ -52,7 +52,11 @@ export async function findActiveExactMemory(
 
   const [backfilled] = await db.update(memories)
     .set({ contentHash: resolvedDigest })
-    .where(and(eq(memories.id, phaseOneMatch.id), isNull(memories.contentHash)))
+    .where(and(
+      eq(memories.id, phaseOneMatch.id),
+      ...common,
+      isNull(memories.contentHash),
+    ))
     .returning();
   if (backfilled !== undefined) {
     return backfilled;
