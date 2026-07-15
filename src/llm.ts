@@ -150,8 +150,10 @@ export async function reflectWithGraphModel(env: Env, input: GraphReflectionInpu
       body: JSON.stringify({
         model: configuration.model,
         response_format: { type: 'json_object' },
-        reasoning_effort: configuration.thinkingLevel,
-        ...(configuration.thinkingEnabled ? { thinking: { type: 'enabled' } } : {}),
+        ...(configuration.thinkingLevel === 'disabled' ? {} : { reasoning_effort: configuration.thinkingLevel }),
+        ...(configuration.thinkingLevel !== 'disabled' && isDeepSeekEndpoint(configuration.baseUrl)
+          ? { thinking: { type: 'enabled' } }
+          : {}),
         messages: [
           {
             role: 'system',
@@ -222,8 +224,7 @@ function graphLlmConfiguration(env: Env): {
   apiKey: string;
   baseUrl: string;
   model: string;
-  thinkingLevel: 'low' | 'medium' | 'high';
-  thinkingEnabled: boolean;
+  thinkingLevel: 'disabled' | 'low' | 'medium' | 'high';
 } {
   const missing = [
     ['GRAPH_LLM_API_BASE_URL', env.GRAPH_LLM_API_BASE_URL],
@@ -237,11 +238,7 @@ function graphLlmConfiguration(env: Env): {
 
   const thinking = GraphThinkingLevelSchema.safeParse(env.GRAPH_LLM_THINKING_LEVEL ?? 'low');
   if (!thinking.success) {
-    throw new GraphLlmConfigurationError('GRAPH_LLM_THINKING_LEVEL must be low, medium, or high');
-  }
-  const thinkingEnabled = env.GRAPH_LLM_THINKING_ENABLED ?? 'false';
-  if (thinkingEnabled !== 'true' && thinkingEnabled !== 'false') {
-    throw new GraphLlmConfigurationError('GRAPH_LLM_THINKING_ENABLED must be true or false');
+    throw new GraphLlmConfigurationError('GRAPH_LLM_THINKING_LEVEL must be disabled, low, medium, or high');
   }
 
   return {
@@ -249,8 +246,15 @@ function graphLlmConfiguration(env: Env): {
     baseUrl: normalizeBaseUrl(env.GRAPH_LLM_API_BASE_URL!.trim()),
     model: env.GRAPH_LLM_MODEL!.trim(),
     thinkingLevel: thinking.data,
-    thinkingEnabled: thinkingEnabled === 'true',
   };
+}
+
+function isDeepSeekEndpoint(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === 'api.deepseek.com';
+  } catch {
+    return false;
+  }
 }
 
 function normalizeBaseUrl(value: string): string {

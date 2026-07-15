@@ -9,7 +9,7 @@ export const ReflectRequestSchema = z.object({
 });
 
 export const ReflectUncertaintySchema = z.enum(['low', 'medium', 'high']);
-export const GraphThinkingLevelSchema = z.enum(['low', 'medium', 'high']);
+export const GraphThinkingLevelSchema = z.enum(['disabled', 'low', 'medium', 'high']);
 const GraphEntityRefSchema = z.string().regex(/^E[1-9]\d*$/);
 const GraphRelationRefSchema = z.string().regex(/^R[1-9]\d*$/);
 

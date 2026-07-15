@@ -252,10 +252,12 @@ describe('reflectWithGraphModel', () => {
 
     await reflectWithGraphModel({ ...graphEnv, GRAPH_LLM_THINKING_LEVEL: 'high' }, input);
 
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ reasoning_effort: 'high' });
+    const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(payload).toMatchObject({ reasoning_effort: 'high' });
+    expect(payload).not.toHaveProperty('thinking');
   });
 
-  it('enables DeepSeek thinking only when explicitly configured', async () => {
+  it('omits graph reasoning and thinking when disabled', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
         result: 'Benoit is connected to Ada.', evidence_relation_refs: ['R1'],
@@ -263,24 +265,32 @@ describe('reflectWithGraphModel', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
 
-    await reflectWithGraphModel({ ...graphEnv, GRAPH_LLM_THINKING_ENABLED: 'true' }, input);
+    await reflectWithGraphModel({ ...graphEnv, GRAPH_LLM_THINKING_LEVEL: 'disabled' }, input);
 
+    const payload = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(payload).not.toHaveProperty('reasoning_effort');
+    expect(payload).not.toHaveProperty('thinking');
+  });
+
+  it('enables thinking automatically for the normalized DeepSeek hostname', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        result: 'Benoit is connected to Ada.', evidence_relation_refs: ['R1'],
+      }) } }] }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await reflectWithGraphModel({
+      ...graphEnv,
+      GRAPH_LLM_API_BASE_URL: 'https://API.DEEPSEEK.COM/v1/',
+      GRAPH_LLM_THINKING_LEVEL: 'medium',
+    }, input);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://API.DEEPSEEK.COM/v1/chat/completions', expect.anything());
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      reasoning_effort: 'medium',
       thinking: { type: 'enabled' },
     });
-  });
-
-  it('omits DeepSeek thinking when explicitly disabled', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
-        result: 'Benoit is connected to Ada.', evidence_relation_refs: ['R1'],
-      }) } }] }), { status: 200 }),
-    );
-    vi.stubGlobal('fetch', fetchMock);
-
-    await reflectWithGraphModel({ ...graphEnv, GRAPH_LLM_THINKING_ENABLED: 'false' }, input);
-
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty('thinking');
   });
 
   it('sets a 20,000 ms graph reflection deadline', async () => {
@@ -301,8 +311,7 @@ describe('reflectWithGraphModel', () => {
     ['GRAPH_LLM_API_BASE_URL', { ...graphEnv, GRAPH_LLM_API_BASE_URL: undefined }],
     ['GRAPH_LLM_MODEL', { ...graphEnv, GRAPH_LLM_MODEL: undefined }],
     ['GRAPH_LLM_API_KEY', { ...graphEnv, GRAPH_LLM_API_KEY: undefined }],
-    ['GRAPH_LLM_THINKING_LEVEL', { ...graphEnv, GRAPH_LLM_THINKING_LEVEL: 'max' }],
-    ['GRAPH_LLM_THINKING_ENABLED', { ...graphEnv, GRAPH_LLM_THINKING_ENABLED: 'yes' }],
+    ['GRAPH_LLM_THINKING_LEVEL', { ...graphEnv, GRAPH_LLM_THINKING_LEVEL: 'invalid' }],
   ])('rejects missing or invalid %s configuration', async (_field, invalidEnv) => {
     await expect(reflectWithGraphModel(invalidEnv, input)).rejects.toBeInstanceOf(GraphLlmConfigurationError);
   });

@@ -45,7 +45,6 @@ export interface Env {
   GRAPH_LLM_MODEL?: string;
   GRAPH_LLM_API_KEY?: string;
   GRAPH_LLM_THINKING_LEVEL?: string;
-  GRAPH_LLM_THINKING_ENABLED?: string;
   VECTOR_DIMENSIONS: string;
   MEM0_INDEX_NAME: string;
 }
