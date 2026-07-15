@@ -9,6 +9,10 @@ enabled = true
 enabled = true
 invocation_logs = true
 
+[[routes]]
+pattern = "mem0.yanksi.li"
+custom_domain = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "mem0-edge"
