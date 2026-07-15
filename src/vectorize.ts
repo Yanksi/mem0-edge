@@ -6,7 +6,19 @@ export interface VectorSearchResult {
   metadata?: Record<string, VectorizeVectorMetadataValue>;
 }
 
+export interface EntityVector extends VectorizeVector {
+  metadata: { user_id: string } & Record<string, VectorizeVectorMetadataValue>;
+}
+
+export interface MemoryVectorSearchOptions {
+  candidatePool?: number;
+}
+
 export function upsertVectors(index: VectorizeIndex, records: VectorizeVector[]) {
+  return index.upsert(records);
+}
+
+export function upsertEntityVectors(index: VectorizeIndex, records: EntityVector[]) {
   return index.upsert(records);
 }
 
@@ -24,6 +36,7 @@ export async function searchVectors(
   index: VectorizeIndex,
   vector: number[],
   request: SearchMemoryRequest,
+  options: MemoryVectorSearchOptions = {},
 ): Promise<VectorSearchResult[]> {
   validateMetadataFilter(request.filters, false);
   const filter = {
@@ -36,10 +49,29 @@ export async function searchVectors(
   validateMetadataFilter(filter, true);
 
   const result = await index.query(vector, {
-    topK: Math.min(request.limit, 50),
+    topK: Math.min(options.candidatePool ?? request.limit, 50),
     returnMetadata: 'all',
     returnValues: false,
     filter: filter as VectorizeVectorMetadataFilter,
+  });
+
+  return result.matches.map(({ id, score, metadata }) => ({
+    id,
+    score,
+    metadata: metadata as VectorSearchResult['metadata'],
+  }));
+}
+
+export async function searchEntityVectors(
+  index: VectorizeIndex,
+  vector: number[],
+  userId: string,
+): Promise<VectorSearchResult[]> {
+  const result = await index.query(vector, {
+    topK: 20,
+    returnMetadata: 'all',
+    returnValues: false,
+    filter: { user_id: userId },
   });
 
   return result.matches.map(({ id, score, metadata }) => ({

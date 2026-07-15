@@ -1,8 +1,18 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { SearchMemoryRequest } from '../src/memory/types';
-import { deleteVector, deleteVectors, searchVectors, type VectorSearchResult, upsertVectors } from '../src/vectorize';
+import {
+  deleteVector,
+  deleteVectors,
+  searchEntityVectors,
+  searchVectors,
+  type EntityVector,
+  type VectorSearchResult,
+  upsertEntityVectors,
+  upsertVectors,
+} from '../src/vectorize';
 
 expectTypeOf<VectorSearchResult['metadata']>().toEqualTypeOf<Record<string, VectorizeVectorMetadataValue> | undefined>();
+expectTypeOf<EntityVector['metadata']['user_id']>().toEqualTypeOf<string>();
 
 describe('Vectorize wrappers', () => {
   it('upserts records and deletes individual vector IDs', async () => {
@@ -87,6 +97,49 @@ describe('Vectorize wrappers', () => {
         run_id: 'run-123',
         actor_id: 'actor-123',
       },
+    });
+  });
+
+  it('allows an internal semantic candidate pool larger than the requested result limit', async () => {
+    const index = {
+      query: vi.fn().mockResolvedValue({ matches: [] }),
+    } as unknown as VectorizeIndex;
+    const request = {
+      query: 'Zurich',
+      user_id: 'user-123',
+      filters: {},
+      limit: 5,
+    } as SearchMemoryRequest;
+
+    await searchVectors(index, [0.1, 0.2], request, { candidatePool: 50 });
+
+    expect(index.query).toHaveBeenCalledWith([0.1, 0.2], expect.objectContaining({ topK: 50 }));
+  });
+
+  it('upserts typed entity records and searches entities scoped only by user ID', async () => {
+    const index = {
+      upsert: vi.fn().mockResolvedValue({}),
+      query: vi.fn().mockResolvedValue({
+        matches: [{ id: 'entity-123', score: 0.95, values: [0.1, 0.2], metadata: { user_id: 'user-123', entity: 'Zurich' } }],
+      }),
+    } as unknown as VectorizeIndex;
+    const records: EntityVector[] = [{
+      id: 'entity-123',
+      values: [0.1, 0.2],
+      metadata: { user_id: 'user-123', entity: 'Zurich' },
+    }];
+
+    await upsertEntityVectors(index, records);
+
+    await expect(searchEntityVectors(index, [0.1, 0.2], 'user-123')).resolves.toEqual([
+      { id: 'entity-123', score: 0.95, metadata: { user_id: 'user-123', entity: 'Zurich' } },
+    ]);
+    expect(index.upsert).toHaveBeenCalledWith(records);
+    expect(index.query).toHaveBeenCalledWith([0.1, 0.2], {
+      topK: 20,
+      returnMetadata: 'all',
+      returnValues: false,
+      filter: { user_id: 'user-123' },
     });
   });
 

@@ -12,6 +12,10 @@ migrations_dir = "src/migrations"
 binding = "VECTORIZE"
 index_name = "mem0-edge"
 
+[[vectorize]]
+binding = "ENTITY_VECTORIZE"
+index_name = "mem0-edge-entities"
+
 [[queues.producers]]
 binding = "MEMORY_JOBS"
 queue = "mem0-edge-memory-jobs"

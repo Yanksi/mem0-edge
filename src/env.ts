@@ -31,6 +31,7 @@ export type MemoryJob = ExtractMemoryJob | Mem0ImportJob | ReclassifyMem0AgentJo
 export interface Env {
   DB: D1Database;
   VECTORIZE: VectorizeIndex;
+  ENTITY_VECTORIZE: VectorizeIndex;
   MEMORY_JOBS: Queue<MemoryJob>;
   OPENAI_API_KEY: string;
   MEM0_API_KEY: string;
