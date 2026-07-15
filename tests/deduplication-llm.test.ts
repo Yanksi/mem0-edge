@@ -147,6 +147,20 @@ describe('selectSemanticDuplicate', () => {
     );
   });
 
+  it('keeps response-body timeout failures on the transport failure path', async () => {
+    const timeoutError = new DOMException('The response body timed out', 'TimeoutError');
+    const body = new ReadableStream({
+      start(controller) {
+        controller.error(timeoutError);
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
+
+    await expect(selectSemanticDuplicate(env, input)).rejects.toThrow(
+      'Semantic deduplication request failed: The response body timed out',
+    );
+  });
+
   it('rejects a model-selected ref that was not supplied', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(responseWithResult({ duplicate_of: 'C99' })));
 

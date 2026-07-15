@@ -102,9 +102,16 @@ export async function selectSemanticDuplicate(env: Env, input: DedupLlmInput): P
     );
   }
 
+  let responseBody: string;
+  try {
+    responseBody = await response.text();
+  } catch (error) {
+    throw new Error(`Semantic deduplication request failed: ${errorMessage(error)}`);
+  }
+
   let payload: unknown;
   try {
-    payload = await response.json();
+    payload = JSON.parse(responseBody);
   } catch {
     throw invalidResult();
   }
