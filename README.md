@@ -45,8 +45,10 @@ All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard 
 
 - **Extraction model:** `gpt-4o-mini` (`LLM_MODEL`)
 - **Embedding model:** `text-embedding-3-small` (`EMBEDDING_MODEL`)
-- **Extraction endpoint:** `https://api.openai.com/v1` by default (`LLM_API_BASE_URL`)
-- **Embedding endpoint:** `https://api.openai.com/v1` by default (`EMBEDDING_API_BASE_URL`)
+- **Extraction endpoint:** `https://openrouter.ai/api/v1` by default (`LLM_API_BASE_URL`)
+- **Embedding endpoint:** `https://openrouter.ai/api/v1` by default (`EMBEDDING_API_BASE_URL`)
+
+Graph reflection uses a separate OpenRouter-backed model configuration: `GRAPH_LLM_API_BASE_URL`, `GRAPH_LLM_MODEL`, `GRAPH_LLM_THINKING_LEVEL`, and the `GRAPH_LLM_API_KEY` secret. Its default model is `deepseek/deepseek-v4-flash` with `low` reasoning. The graph reflection request uses OpenRouter's unified `reasoning` parameter, so this feature is currently adapted only for an OpenRouter endpoint.
 
 Both endpoints are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored.
 
@@ -190,8 +192,11 @@ Models and endpoints are normal Worker variables, not secrets. Set their deploye
 ```toml
 LLM_MODEL=gpt-4o-mini
 EMBEDDING_MODEL=text-embedding-3-small
-LLM_API_BASE_URL=https://api.openai.com/v1
-EMBEDDING_API_BASE_URL=https://api.openai.com/v1
+LLM_API_BASE_URL=https://openrouter.ai/api/v1
+EMBEDDING_API_BASE_URL=https://openrouter.ai/api/v1
+GRAPH_LLM_API_BASE_URL=https://openrouter.ai/api/v1
+GRAPH_LLM_MODEL=deepseek/deepseek-v4-flash
+GRAPH_LLM_THINKING_LEVEL=low
 ```
 
 `LLM_MODEL` and `EMBEDDING_MODEL` are configurable independently. Ensure the selected embedding model returns **1,536 dimensions or fewer**: Cloudflare Vectorize currently caps vectors at 1,536 float32 dimensions. This Worker rejects larger embedding responses before attempting an upsert. [Cloudflare Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/)
@@ -270,8 +275,9 @@ npm run typecheck
    ```sh
    npx wrangler secret put OPENAI_API_KEY
    npx wrangler secret put MEM0_API_KEY
-   npx wrangler secret put DASHBOARD_PASSWORD
-   ```
+npx wrangler secret put DASHBOARD_PASSWORD
+npx wrangler secret put GRAPH_LLM_API_KEY
+```
 
 `EMBEDDING_MODEL` and `LLM_MODEL` are runtime settings. `VECTOR_DIMENSIONS` and `MEM0_INDEX_NAME` document the deployment convention; the effective Vectorize resource is the `[[vectorize]]` binding, and its dimensions must match the embedding model response.
 
