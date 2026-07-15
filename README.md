@@ -50,7 +50,7 @@ All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard 
 
 Graph reflection uses separate Worker variables: `GRAPH_LLM_API_BASE_URL` (default `https://openrouter.ai/api/v1`), `GRAPH_LLM_MODEL` (default `deepseek/deepseek-v4-flash`), and `GRAPH_LLM_THINKING_LEVEL` (default `low`). Set `GRAPH_LLM_API_KEY` as a Cloudflare secret; it is intentionally not a `wrangler.toml` variable. Thinking levels `disabled`, `low`, `medium`, and `high` map to OpenRouter's `reasoning` object: `disabled` sends `{ "enabled": false }`, while the other values send `{ "effort": "low" | "medium" | "high" }`. Graph reflection currently only adapts the OpenRouter endpoint.
 
-Both endpoints and their credentials are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored. When both endpoints use the same provider, the same provider key may be stored in both secrets; keeping the bindings separate lets either endpoint move to a different provider later.
+Both endpoints and their credentials are configured independently and must implement the OpenAI-compatible `/chat/completions` or `/embeddings` path respectively. Base URLs may include `/v1`; trailing slashes are ignored. `LLM_API_KEY`, `EMBEDDING_API_KEY`, and `GRAPH_LLM_API_KEY` are three separate required secrets for their respective model paths; no model path reads another path's key.
 
 ### Hermes compatibility
 
@@ -340,7 +340,7 @@ npm run typecheck
    npx wrangler secret put GRAPH_LLM_API_KEY
    ```
 
-For an existing deployment, create both `LLM_API_KEY` and `EMBEDDING_API_KEY` before deploying this version. If both providers are OpenRouter, enter the same OpenRouter key for both. The legacy `OPENAI_API_KEY` is no longer read and can be removed after the deployment succeeds.
+For an existing deployment, create both `LLM_API_KEY` and `EMBEDDING_API_KEY` before deploying this version. `GRAPH_LLM_API_KEY` remains the separate graph reflection credential. The legacy `OPENAI_API_KEY` is no longer read and can be removed after the deployment succeeds.
 
 `EMBEDDING_MODEL` and `LLM_MODEL` are runtime settings. `VECTOR_DIMENSIONS` and `MEM0_INDEX_NAME` document the deployment convention; the effective Vectorize resource is the `[[vectorize]]` binding, and its dimensions must match the embedding model response.
 
