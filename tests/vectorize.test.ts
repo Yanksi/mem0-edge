@@ -3,6 +3,7 @@ import type { SearchMemoryRequest } from '../src/memory/types';
 import {
   deleteVector,
   deleteVectors,
+  searchDeduplicationCandidates,
   searchEntityVectors,
   searchVectors,
   type EntityVector,
@@ -114,6 +115,44 @@ describe('Vectorize wrappers', () => {
     await searchVectors(index, [0.1, 0.2], request, { candidatePool: 50 });
 
     expect(index.query).toHaveBeenCalledWith([0.1, 0.2], expect.objectContaining({ topK: 50 }));
+  });
+
+  it('searches deduplication candidates in the exact scope without metadata or values', async () => {
+    const index = {
+      query: vi.fn().mockResolvedValue({
+        matches: [{ id: 'memory-123', score: 0.91, metadata: { ignored: true }, values: [0.9] }],
+      }),
+    } as unknown as VectorizeIndex;
+    const embedding = [0.1, 0.2];
+    const expectedScopeKey = 'scope-key-123';
+
+    await expect(searchDeduplicationCandidates(index, embedding, expectedScopeKey, 8)).resolves.toEqual([
+      { id: 'memory-123', score: 0.91 },
+    ]);
+    expect(index.query).toHaveBeenCalledWith(embedding, {
+      topK: 8,
+      returnMetadata: 'none',
+      returnValues: false,
+      filter: { scope_key: expectedScopeKey },
+    });
+  });
+
+  it.each([
+    [0, 1],
+    [-10, 1],
+    [21, 20],
+    [999, 20],
+  ])('caps deduplication candidate limit %i to %i', async (limit, topK) => {
+    const index = {
+      query: vi.fn().mockResolvedValue({ matches: [] }),
+    } as unknown as VectorizeIndex;
+
+    await searchDeduplicationCandidates(index, [0.1, 0.2], 'scope-key-123', limit);
+
+    expect(index.query).toHaveBeenCalledWith(
+      [0.1, 0.2],
+      expect.objectContaining({ topK }),
+    );
   });
 
   it('upserts typed entity records and searches entities scoped only by user ID', async () => {

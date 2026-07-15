@@ -62,6 +62,22 @@ export async function searchVectors(
   }));
 }
 
+export async function searchDeduplicationCandidates(
+  index: VectorizeIndex,
+  vector: number[],
+  exactScopeKey: string,
+  limit: number,
+): Promise<VectorSearchResult[]> {
+  const result = await index.query(vector, {
+    topK: Math.min(Math.max(limit, 1), 20),
+    returnMetadata: 'none',
+    returnValues: false,
+    filter: { scope_key: exactScopeKey },
+  });
+
+  return result.matches.map(({ id, score }) => ({ id, score }));
+}
+
 export async function searchEntityVectors(
   index: VectorizeIndex,
   vector: number[],
