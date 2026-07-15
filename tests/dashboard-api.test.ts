@@ -9,6 +9,7 @@ const dashboardService = vi.hoisted(() => ({
   listDashboardDuplicateMemoryIds: vi.fn(),
   listDashboardSoftDeletedMemoryIds: vi.fn(),
   softDeleteDashboardMemories: vi.fn(),
+  reindexDashboardMemory: vi.fn(),
 }));
 const vectorize = vi.hoisted(() => ({
   deleteVectors: vi.fn(),
@@ -385,6 +386,20 @@ describe('dashboard operator API', () => {
     expect(importService.enqueueMem0Import).toHaveBeenCalledWith(env, {
       entityType: 'agent', entityId: 'hermes',
     }, exportPayload);
+  });
+
+  it('reindexes one authenticated agent memory without changing its scope', async () => {
+    dashboardService.reindexDashboardMemory.mockResolvedValue(true);
+
+    const response = await worker.fetch(request('/dashboard/api/memories/memory-1/reindex', {
+      method: 'POST',
+      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes' }),
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true });
+    expect(dashboardService.reindexDashboardMemory).toHaveBeenCalledWith(env, 'agent', 'hermes', 'memory-1');
   });
 
   it('queues an authenticated agent reclassification from query parameters', async () => {

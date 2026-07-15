@@ -6,6 +6,7 @@ import {
   listDashboardDuplicateMemoryIds,
   listDashboardMemories,
   listDashboardSoftDeletedMemoryIds,
+  reindexDashboardMemory,
   listDashboardUsers,
   setDashboardUserAlias,
   softDeleteDashboardMemories,
@@ -98,6 +99,17 @@ dashboardRoutes.post('/api/deduplication', async (context) => {
 
   if (vectorIds.length > 0) await deleteVectors(context.env.VECTORIZE, vectorIds);
   return context.json({ removed: confirmedIds.length });
+});
+
+dashboardRoutes.post('/api/memories/:id/reindex', async (context) => {
+  const readOnlyError = dashboardMutationReadOnlyError(context.env);
+  if (readOnlyError !== undefined) return context.json(readOnlyError, 403);
+  const body = await context.req.json<{ entity_type?: unknown; entity_id?: unknown }>().catch(() => null);
+  const scope = body === null ? undefined : dashboardScope(body.entity_type, body.entity_id, undefined);
+  if (scope === undefined) return context.json({ error: 'Validation failed' }, 400);
+
+  const reindexed = await reindexDashboardMemory(context.env, scope.entityType, scope.entityId, context.req.param('id'));
+  return reindexed ? context.json({ ok: true }) : context.json({ error: 'Memory not found' }, 404);
 });
 
 dashboardRoutes.post('/api/search', async (context) => {

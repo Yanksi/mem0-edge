@@ -1,5 +1,7 @@
 import type { Env } from '../env';
+import { embedText } from '../llm';
 import type { MemoryResponse } from '../memory/types';
+import { upsertVectors } from '../vectorize';
 
 const PAGE_SIZE = 50;
 
@@ -180,6 +182,29 @@ export async function softDeleteDashboardMemories(
   return deleted;
 }
 
+export async function reindexDashboardMemory(
+  env: Env,
+  entityType: DashboardEntityType,
+  entityId: string,
+  memoryId: string,
+): Promise<boolean> {
+  const column = dashboardScopeColumn(entityType);
+  const row = await env.DB.prepare(`
+    SELECT id, user_id, agent_id, run_id, actor_id, content, metadata_json, created_at, updated_at
+    FROM memories
+    WHERE id = ? AND ${column} = ? AND deleted_at IS NULL
+  `).bind(memoryId, entityId).first<MemoryRow>();
+  if (row === null) return false;
+
+  const vector = await embedText(env, row.content);
+  await upsertVectors(env.VECTORIZE, [{
+    id: row.id,
+    values: vector,
+    metadata: vectorMetadata(row),
+  }]);
+  return true;
+}
+
 function dashboardScopeColumn(entityType: DashboardEntityType): 'user_id' | 'agent_id' {
   return entityType === 'user' ? 'user_id' : 'agent_id';
 }
@@ -219,4 +244,18 @@ function parseMetadata(value: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function vectorMetadata(row: MemoryRow): Record<string, VectorizeVectorMetadataValue> {
+  const metadata = parseMetadata(row.metadata_json);
+  const scalarMetadata = Object.fromEntries(Object.entries(metadata).filter(([, value]) => (
+    value === null || typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))
+  ))) as Record<string, VectorizeVectorMetadataValue>;
+  return {
+    ...scalarMetadata,
+    ...(row.user_id === null ? {} : { user_id: row.user_id }),
+    ...(row.agent_id === null ? {} : { agent_id: row.agent_id }),
+    ...(row.run_id === null ? {} : { run_id: row.run_id }),
+    ...(row.actor_id === null ? {} : { actor_id: row.actor_id }),
+  };
 }
