@@ -29,7 +29,7 @@ dashboardRoutes.get('/', async (context) => {
   const password = context.req.header('x-dashboard-password') ?? '';
   const hasSession = await hasValidDashboardSession(context.req.header('Cookie'), context.env.DASHBOARD_PASSWORD);
   if (!hasSession && !checkDashboardPassword(password, context.env)) return context.html(renderDashboardLogin(), 401);
-  return context.html(renderDashboard());
+  return context.html(renderDashboard(context.env.DASHBOARD_READ_ONLY === 'true'));
 });
 
 dashboardRoutes.post('/login', async (context) => {

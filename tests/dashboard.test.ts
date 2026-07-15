@@ -5,12 +5,33 @@ import worker from '../src/index';
 const env = {
   DASHBOARD_PASSWORD: 'dashboard-secret',
 } as Env;
+const readOnlyEnv = {
+  DASHBOARD_PASSWORD: 'dashboard-secret',
+  DASHBOARD_READ_ONLY: 'true',
+} as Env;
 
 function request(path: string, init?: RequestInit): Request {
   return new Request(`https://example.com${path}`, init);
 }
 
 describe('GET /dashboard', () => {
+  it('renders read-only controls and synchronized graph guidance in the remote preview', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), readOnlyEnv);
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(html).toContain('Remote read-only preview');
+    expect(html).toContain('const readonly = true;');
+    expect(html).toContain("document.getElementById('alias-button').disabled = true;");
+    expect(html).toContain("document.getElementById('deduplicate-button').disabled = true;");
+    expect(html).toContain("document.querySelectorAll('#import-form input, #import-form select, #import-form textarea, #import-form button')");
+    expect(html).toContain("if (state.currentView === 'graph') await loadGraph();");
+    expect(html).toContain('Select the corresponding user entity to view its graph.');
+    expect(html).toContain('id="graph-status" class="muted" aria-live="polite"');
+  });
+
   it('returns an Unauthorized login form when the dashboard password header is missing or wrong', async () => {
     for (const init of [undefined, { headers: { 'x-dashboard-password': 'wrong-password' } }]) {
       const response = await worker.fetch(request('/dashboard', init), env);
@@ -53,6 +74,8 @@ describe('GET /dashboard', () => {
     expect(html).toContain('catch (error)');
     expect(html).toContain("'Request failed'");
     expect(html).not.toContain('name="api_key"');
+    expect(html).not.toContain('Remote read-only preview');
+    expect(html).toContain('const readonly = false;');
   });
 
   it('renders the operator navigation and dashboard data endpoints', async () => {
