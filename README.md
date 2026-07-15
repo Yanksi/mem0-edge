@@ -215,7 +215,7 @@ Use the local URL printed by Wrangler, typically `http://localhost:8787`. Visit 
 
 ### Remote read-only dashboard preview
 
-Run `npm run dev:remote-readonly` to preview local dashboard code against the configured remote Worker resources. The preview reads remote data but the server rejects dashboard alias, deduplication, import, and agent-reclassification mutations with `403`; it does not change the deployed Worker configuration.
+Run `npm run dev:remote-readonly` to execute local dashboard code with the configured remote D1 and Vectorize resources; queue bindings remain local. The preview reads remote data but the server rejects dashboard alias, deduplication, import, and agent-reclassification mutations with `403`; it does not change the deployed Worker configuration.
 
 Open the local URL printed by Wrangler, sign in with `DASHBOARD_PASSWORD`, select `User: curl-403-probe-user-5940ad806c8e4792a38908c026b276e3`, and open **Memory graph** to inspect the retained graph probe data.
 

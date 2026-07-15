@@ -1,0 +1,42 @@
+name = "mem0-edge"
+main = "src/index.ts"
+compatibility_date = "2026-07-14"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mem0-edge"
+database_id = "f477a9e5-2f2c-4821-8ea7-0f11fb8ace2a"
+migrations_dir = "src/migrations"
+remote = true
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "mem0-edge"
+remote = true
+
+[[vectorize]]
+binding = "ENTITY_VECTORIZE"
+index_name = "mem0-edge-entities"
+remote = true
+
+[[queues.producers]]
+binding = "MEMORY_JOBS"
+queue = "mem0-edge-memory-jobs"
+
+[[queues.consumers]]
+queue = "mem0-edge-memory-jobs"
+
+[vars]
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
+LLM_MODEL = "openai/gpt-4o-mini"
+LLM_API_BASE_URL = "https://openrouter.ai/api/v1"
+EMBEDDING_API_BASE_URL = "https://openrouter.ai/api/v1"
+VECTOR_DIMENSIONS = "1536"
+MEM0_INDEX_NAME = "mem0-edge"

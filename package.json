@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "dev:remote-readonly": "wrangler dev --remote --var DASHBOARD_READ_ONLY:true",
+    "dev:remote-readonly": "wrangler dev --config wrangler.remote-preview.toml --var DASHBOARD_READ_ONLY:true",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
