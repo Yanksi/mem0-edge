@@ -38,6 +38,7 @@ export const memories = sqliteTable(
     content: text('content').notNull(),
     metadataJson: text('metadata_json').notNull().default('{}'),
     hash: text('hash').notNull(),
+    contentHash: text('content_hash'),
     createdAt,
     updatedAt,
     deletedAt: integer('deleted_at'),
@@ -143,6 +144,7 @@ export const memoryRequests = sqliteTable(
     completedAt: text('completed_at'),
     leaseToken: integer('lease_token').notNull().default(0),
     candidatesJson: text('candidates_json'),
+    cleanupVectorIdsJson: text('cleanup_vector_ids_json'),
   },
   (table) => [
     primaryKey({ columns: [table.userId, table.idempotencyKey] }),
@@ -167,6 +169,7 @@ export const mem0ImportRequests = sqliteTable(
     createdAt,
     updatedAt,
     completedAt: integer('completed_at'),
+    cleanupVectorId: text('cleanup_vector_id'),
   },
   (table) => [
     index('mem0_import_requests_status_updated_at_idx').on(table.status, table.updatedAt),
@@ -187,3 +190,11 @@ export const userAliases = sqliteTable(
     updatedAt,
   },
 );
+
+export const serviceSettings = sqliteTable('service_settings', {
+  id: integer('id').primaryKey(),
+  semanticDedupEnabled: integer('semantic_dedup_enabled', { mode: 'boolean' })
+    .notNull()
+    .default(false),
+  updatedAt,
+});

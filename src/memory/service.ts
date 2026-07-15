@@ -291,6 +291,7 @@ async function createMemoriesForLease(
       content,
       metadataJson,
       hash,
+      contentHash: null,
       createdAt: now,
       updatedAt: now,
       deletedAt: null,

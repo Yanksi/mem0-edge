@@ -13,6 +13,8 @@ import agentScopedMemoriesMigration from '../src/migrations/0004_agent_scoped_me
 import reflectGraphIndexesMigration from '../src/migrations/0005_reflect_graph_indexes.sql?raw';
 // @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
 import mem0ImportRequestsMigration from '../src/migrations/0006_mem0_import_requests.sql?raw';
+// @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
+import memoryDeduplicationPrepareMigration from '../src/migrations/0007_memory_deduplication_prepare.sql?raw';
 import {
   apiKeys,
   entities,
@@ -22,6 +24,7 @@ import {
   memoryEntityLinks,
   memoryHistory,
   relationships,
+  serviceSettings,
 } from '../src/db/schema';
 
 describe('database schema', () => {
@@ -95,6 +98,7 @@ describe('database schema', () => {
       'created_at',
       'updated_at',
       'completed_at',
+      'cleanup_vector_id',
     ]);
     expect(mem0ImportRequests.entityType.notNull).toBe(true);
     expect(mem0ImportRequests.entityId.notNull).toBe(true);
@@ -205,6 +209,7 @@ describe('database schema', () => {
       'completed_at',
       'lease_token',
       'candidates_json',
+      'cleanup_vector_ids_json',
     ]);
     expect(idempotencyRequestsMigration).toContain('CREATE TABLE memory_requests (');
     expect(idempotencyRequestsMigration).toContain('PRIMARY KEY (user_id, idempotency_key)');
@@ -241,5 +246,59 @@ describe('database schema', () => {
     expect(agentScopedMemoriesMigration).toContain('CREATE TABLE memory_history_rebuild');
     expect(agentScopedMemoriesMigration).toContain('CREATE TABLE relationships_rebuild');
     expect(agentScopedMemoriesMigration).toContain('CREATE TABLE memory_entity_links_rebuild');
+  });
+
+  it('prepares nullable deduplication and vector-cleanup columns in migration 0007', () => {
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'ALTER TABLE memories ADD COLUMN content_hash TEXT;',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'ALTER TABLE memory_requests ADD COLUMN cleanup_vector_ids_json TEXT;',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_id TEXT;',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'CREATE INDEX memories_active_user_agent_content_hash_lookup_idx\n  ON memories (user_id, agent_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NOT NULL;',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'CREATE INDEX memories_active_user_content_hash_lookup_idx\n  ON memories (user_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NULL;',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'CREATE INDEX memories_active_agent_content_hash_lookup_idx\n  ON memories (agent_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NULL AND agent_id IS NOT NULL;',
+    );
+  });
+
+  it('creates a disabled singleton semantic-deduplication setting in migration 0007', () => {
+    expect(memoryDeduplicationPrepareMigration).toContain('CREATE TABLE service_settings (');
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1)',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'semantic_dedup_enabled INTEGER NOT NULL DEFAULT 0 CHECK (semantic_dedup_enabled IN (0, 1))',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'updated_at INTEGER NOT NULL DEFAULT (unixepoch())',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
+      'INSERT INTO service_settings (id, semantic_dedup_enabled) VALUES (1, 0);',
+    );
+  });
+
+  it('declares phase-one deduplication fields and service settings in Drizzle', () => {
+    expect(memories.contentHash.name).toBe('content_hash');
+    expect(memories.contentHash.notNull).toBe(false);
+    expect(memoryRequests.cleanupVectorIdsJson.name).toBe('cleanup_vector_ids_json');
+    expect(memoryRequests.cleanupVectorIdsJson.notNull).toBe(false);
+    expect(mem0ImportRequests.cleanupVectorId.name).toBe('cleanup_vector_id');
+    expect(mem0ImportRequests.cleanupVectorId.notNull).toBe(false);
+
+    expect(serviceSettings.id.name).toBe('id');
+    expect(serviceSettings.id.primary).toBe(true);
+    expect(serviceSettings.semanticDedupEnabled.name).toBe('semantic_dedup_enabled');
+    expect(serviceSettings.semanticDedupEnabled.notNull).toBe(true);
+    expect(serviceSettings.semanticDedupEnabled.default).toBe(false);
+    expect(serviceSettings.updatedAt.name).toBe('updated_at');
+    expect(serviceSettings.updatedAt.notNull).toBe(true);
   });
 });
