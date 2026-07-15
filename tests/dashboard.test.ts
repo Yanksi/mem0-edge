@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { graphResponseMatchesSelection } from '../src/dashboard/page';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 
@@ -13,6 +14,13 @@ const readOnlyEnv = {
 function request(path: string, init?: RequestInit): Request {
   return new Request(`https://example.com${path}`, init);
 }
+
+describe('graphResponseMatchesSelection', () => {
+  it('rejects an old graph response after the entity selection changes', () => {
+    expect(graphResponseMatchesSelection('user', 'old-user', 'user', 'new-user')).toBe(false);
+    expect(graphResponseMatchesSelection('user', 'new-user', 'user', 'new-user')).toBe(true);
+  });
+});
 
 describe('GET /dashboard', () => {
   it('renders read-only controls and synchronized graph guidance in the remote preview', async () => {
@@ -90,6 +98,25 @@ describe('GET /dashboard', () => {
     expect(html).toContain('/dashboard/api/users');
     expect(html).toContain('/dashboard/api/memories');
     expect(html).toContain('/dashboard/api/graph');
+  });
+
+  it('renders the Cytoscape graph runtime instead of the manual SVG renderer', async () => {
+    const response = await worker.fetch(request('/dashboard', {
+      headers: { 'x-dashboard-password': 'dashboard-secret' },
+    }), env);
+    const html = await response.text();
+
+    expect(html).toContain('https://cdn.jsdelivr.net/npm/cytoscape@3.34.0/dist/cytoscape.min.js');
+    expect(html).toContain('integrity="sha384-K+k+ywfDuvV9dwg+bwsVE0WGkrTnqFamaER+ydBgMFQTtlI0jdI9no9AjkQHwh/T"');
+    expect(html).toContain('crossorigin="anonymous"');
+    expect(html).toContain('function graphElements(body)');
+    expect(html).toContain('cytoscape({');
+    expect(html).toContain("'text-wrap': 'wrap'");
+    expect(html).toContain("'shape': 'round-rectangle'");
+    expect(html).toContain('const graphEntityType = state.entityType; const graphEntityId = state.entityId;');
+    expect(html).toContain('function graphResponseMatchesSelection(requestedEntityType, requestedEntityId, currentEntityType, currentEntityId)');
+    expect(html).toContain('if (!graphResponseMatchesSelection(graphEntityType, graphEntityId, state.entityType, state.entityId)) return;');
+    expect(html).not.toContain("createElementNS('http://www.w3.org/2000/svg'");
   });
 
   it('pins the desktop navigation and renders memory detail panels inline', async () => {
