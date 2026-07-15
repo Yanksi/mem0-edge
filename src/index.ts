@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { Env, MemoryJob } from './env';
+import { dispatchPendingMem0Imports } from './import/service';
 import { handleMemoryQueue } from './queue';
 import { dashboardRoutes } from './routes/dashboard';
 import { entitiesRoutes, relationshipsRoutes } from './routes/entities';
@@ -22,4 +23,7 @@ app.route('/v1/reflect', reflectRoutes);
 export default {
   fetch: app.fetch,
   queue: (batch: MessageBatch<MemoryJob>, env: Env) => handleMemoryQueue(batch, env),
+  scheduled: (_controller: ScheduledController, env: Env, context: ExecutionContext) => {
+    context.waitUntil(dispatchPendingMem0Imports(env));
+  },
 };

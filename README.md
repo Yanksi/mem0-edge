@@ -15,7 +15,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - Cloudflare Vectorize upserts, deletes, scoped semantic search, and validated metadata filters.
 - Mem0-compatible entity linking that boosts inferred user-memory search results without changing Hermes requests.
 - D1-backed memory metadata, audit history, graph-lite entities, relationships, and memory/entity links.
-- Durable tenant-scoped idempotency records, retry-safe deterministic writes, and a Queue consumer for asynchronous ingestion.
+- Durable tenant-scoped idempotency records, retry-safe deterministic writes, and bounded Queue consumers for asynchronous ingestion and Mem0 imports.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
 - Dashboard views for semantic search, paginated active-memory browsing, exact-text deduplication across discovered user and agent entities, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
@@ -27,7 +27,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - Hosted Mem0 Platform features such as organizations, billing, advanced user management, and hosted-dashboard parity.
 - Alternative vector stores, graph databases, or the broad LLM/embedder provider matrix from Mem0 OSS.
 - A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
-- Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize index, Queue, metadata indexes, and secrets described below.
+- Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize indexes, Queue and DLQ, metadata indexes, and secrets described below.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
 - Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view. Exact-text deduplication is the limited deletion exception; the dashboard can otherwise only create, change, or remove display aliases for stored user IDs.
 
@@ -36,7 +36,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - **Worker / Hono** exposes the API, health check, and dashboard.
 - **D1** stores memories, idempotency/request state, history, and graph-lite entities/relationships.
 - **Vectorize** stores memory embeddings plus a parallel entity index used for Mem0-style entity-link score fusion.
-- **Queues** receives asynchronous extraction-and-store jobs.
+- **Queues** receives asynchronous extraction-and-store jobs. Import work is backed by a canonical D1 ledger, bounded to one message per batch and two concurrent consumers, retried with delay on transient Vectorize failures, and exhausted deliveries are retained in a DLQ.
 - **OpenAI-compatible endpoints** are used for embeddings and chat-completion memory extraction. They default to the OpenAI API, but extraction and embedding base URLs can be configured independently.
 
 All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard has its own password login.
@@ -201,7 +201,9 @@ The accepted export is exactly this JSON Schema:
 }
 ```
 
-Submitting posts `{ "entity_type": "user" | "agent", "entity_id": "...", "export": { ... } }` to the signed-session dashboard endpoint `/dashboard/api/imports/mem0`. It returns a queued count and processing continues asynchronously through Cloudflare Queues. Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time); import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference.
+Submitting posts `{ "entity_type": "user" | "agent", "entity_id": "...", "export": { ... } }` to the signed-session dashboard endpoint `/dashboard/api/imports/mem0`. It returns a queued count and processing continues asynchronously through Cloudflare Queues. Each item is persisted first in the D1 `mem0_import_requests` ledger. The consumer reads the canonical payload from that ledger, waits for Vectorize to accept the upsert, then atomically publishes the memory, history, and completed status in a lease-fenced D1 batch. A scheduled dispatcher recovers rows left unpublished by a producer interruption. Vectorize query visibility can lag briefly after completion, but an upsert failure cannot leave the import permanently present only in D1.
+
+Each source `memory` is stored as exact text with valid source timestamps preserved (missing timestamps use import time). Import processing embeds the text directly, is retry-idempotent, and performs no LLM extraction or graph inference. The Dashboard does not yet show per-import progress or DLQ failures; cross-message Vectorize batching and durable deduplication maintenance are also not part of this first consistency pass.
 
 ### Add a memory
 

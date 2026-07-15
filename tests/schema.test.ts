@@ -11,9 +11,12 @@ import memoryRequestLeasesMigration from '../src/migrations/0003_memory_request_
 import agentScopedMemoriesMigration from '../src/migrations/0004_agent_scoped_memories.sql?raw';
 // @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
 import reflectGraphIndexesMigration from '../src/migrations/0005_reflect_graph_indexes.sql?raw';
+// @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
+import mem0ImportRequestsMigration from '../src/migrations/0006_mem0_import_requests.sql?raw';
 import {
   apiKeys,
   entities,
+  mem0ImportRequests,
   memories,
   memoryRequests,
   memoryEntityLinks,
@@ -68,6 +71,97 @@ describe('database schema', () => {
         name: 'memory_requests_status_updated_at_idx',
         unique: false,
       }),
+    );
+  });
+
+  it('declares the durable Mem0 import request ledger in the Drizzle schema', () => {
+    const config = getTableConfig(mem0ImportRequests);
+
+    expect(mem0ImportRequests.requestId.name).toBe('request_id');
+    expect(mem0ImportRequests.requestId.getSQLType()).toBe('text');
+    expect(mem0ImportRequests.requestId.primary).toBe(true);
+    expect(Object.values(mem0ImportRequests).map((column) => column.name)).toEqual([
+      'request_id',
+      'entity_type',
+      'entity_id',
+      'item_json',
+      'status',
+      'attempt_count',
+      'lease_token',
+      'publish_token',
+      'publish_attempted_at',
+      'published_at',
+      'error_message',
+      'created_at',
+      'updated_at',
+      'completed_at',
+    ]);
+    expect(mem0ImportRequests.entityType.notNull).toBe(true);
+    expect(mem0ImportRequests.entityId.notNull).toBe(true);
+    expect(mem0ImportRequests.itemJson.notNull).toBe(true);
+    expect(mem0ImportRequests.status.notNull).toBe(true);
+    expect(mem0ImportRequests.errorMessage.notNull).toBe(false);
+    expect(mem0ImportRequests.attemptCount.default).toBe(0);
+    expect(mem0ImportRequests.leaseToken.default).toBe(0);
+    expect(mem0ImportRequests.publishToken.default).toBe(0);
+    expect(mem0ImportRequests.publishAttemptedAt.notNull).toBe(false);
+    expect(mem0ImportRequests.publishedAt.notNull).toBe(false);
+    expect(mem0ImportRequests.createdAt.notNull).toBe(true);
+    expect(mem0ImportRequests.updatedAt.notNull).toBe(true);
+    expect(mem0ImportRequests.completedAt.notNull).toBe(false);
+    expect(config.indexes.map((index) => index.config)).toContainEqual(
+      expect.objectContaining({
+        name: 'mem0_import_requests_status_updated_at_idx',
+        unique: false,
+      }),
+    );
+    expect(config.indexes.map((index) => index.config)).toContainEqual(
+      expect.objectContaining({
+        name: 'mem0_import_requests_dispatch_idx',
+        unique: false,
+      }),
+    );
+  });
+
+  it('creates the durable Mem0 import request ledger in migration 0006', () => {
+    expect(mem0ImportRequestsMigration).toContain('CREATE TABLE mem0_import_requests (');
+    expect(mem0ImportRequestsMigration).toContain('request_id TEXT PRIMARY KEY');
+    expect(mem0ImportRequestsMigration).toContain(
+      "entity_type TEXT NOT NULL CHECK (entity_type IN ('user', 'agent'))",
+    );
+    expect(mem0ImportRequestsMigration).toContain('entity_id TEXT NOT NULL');
+    expect(mem0ImportRequestsMigration).toContain('item_json TEXT NOT NULL');
+    expect(mem0ImportRequestsMigration).toContain(
+      "status TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed'))",
+    );
+    expect(mem0ImportRequestsMigration).toContain(
+      'attempt_count INTEGER NOT NULL DEFAULT 0',
+    );
+    expect(mem0ImportRequestsMigration).toContain('lease_token INTEGER NOT NULL DEFAULT 0');
+    expect(mem0ImportRequestsMigration).toContain(
+      'publish_token INTEGER NOT NULL DEFAULT 0',
+    );
+    expect(mem0ImportRequestsMigration).toContain('publish_attempted_at INTEGER');
+    expect(mem0ImportRequestsMigration).toContain('published_at INTEGER');
+    expect(mem0ImportRequestsMigration).toContain('error_message TEXT');
+    expect(mem0ImportRequestsMigration).toContain(
+      'created_at INTEGER NOT NULL DEFAULT (unixepoch())',
+    );
+    expect(mem0ImportRequestsMigration).toContain(
+      'updated_at INTEGER NOT NULL DEFAULT (unixepoch())',
+    );
+    expect(mem0ImportRequestsMigration).toContain('completed_at INTEGER');
+    expect(mem0ImportRequestsMigration).toContain(
+      'CREATE INDEX mem0_import_requests_status_updated_at_idx',
+    );
+    expect(mem0ImportRequestsMigration).toContain(
+      'ON mem0_import_requests (status, updated_at);',
+    );
+    expect(mem0ImportRequestsMigration).toContain(
+      'CREATE INDEX mem0_import_requests_dispatch_idx',
+    );
+    expect(mem0ImportRequestsMigration).toContain(
+      'ON mem0_import_requests (status, published_at, publish_attempted_at);',
     );
   });
 

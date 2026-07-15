@@ -2,6 +2,9 @@ name = "mem0-edge"
 main = "src/index.ts"
 compatibility_date = "2026-07-14"
 
+[triggers]
+crons = ["*/2 * * * *"]
+
 [observability]
 enabled = true
 
@@ -33,6 +36,11 @@ queue = "mem0-edge-memory-jobs"
 
 [[queues.consumers]]
 queue = "mem0-edge-memory-jobs"
+max_batch_size = 1
+max_concurrency = 2
+max_retries = 8
+retry_delay = 30
+dead_letter_queue = "mem0-edge-memory-jobs-dlq"
 
 [vars]
 EMBEDDING_MODEL = "openai/text-embedding-3-small"

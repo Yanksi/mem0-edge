@@ -150,6 +150,34 @@ export const memoryRequests = sqliteTable(
   ],
 );
 
+export const mem0ImportRequests = sqliteTable(
+  'mem0_import_requests',
+  {
+    requestId: text('request_id').primaryKey(),
+    entityType: text('entity_type').notNull(),
+    entityId: text('entity_id').notNull(),
+    itemJson: text('item_json').notNull(),
+    status: text('status').notNull(),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    leaseToken: integer('lease_token').notNull().default(0),
+    publishToken: integer('publish_token').notNull().default(0),
+    publishAttemptedAt: integer('publish_attempted_at'),
+    publishedAt: integer('published_at'),
+    errorMessage: text('error_message'),
+    createdAt,
+    updatedAt,
+    completedAt: integer('completed_at'),
+  },
+  (table) => [
+    index('mem0_import_requests_status_updated_at_idx').on(table.status, table.updatedAt),
+    index('mem0_import_requests_dispatch_idx').on(
+      table.status,
+      table.publishedAt,
+      table.publishAttemptedAt,
+    ),
+  ],
+);
+
 export const userAliases = sqliteTable(
   'user_aliases',
   {

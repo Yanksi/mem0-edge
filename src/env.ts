@@ -9,11 +9,12 @@ export interface ExtractMemoryJob {
 export interface Mem0ImportJob {
   type: 'import-mem0-memory';
   requestId: string;
+  // New deployments enqueue only the request ID. The remaining fields are
+  // accepted while jobs from pre-ledger deployments drain.
   entityType?: 'user' | 'agent';
   entityId?: string;
-  // Kept while jobs queued by pre-entity deployments drain safely.
   userId?: string;
-  item: RawMemoryMigrationItem;
+  item?: RawMemoryMigrationItem;
   body?: never;
 }
 

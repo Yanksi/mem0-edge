@@ -13,63 +13,72 @@ function isMemoryJob(value: unknown): value is MemoryJob {
 }
 
 export async function handleMemoryQueue(batch: MessageBatch<MemoryJob>, env: Env): Promise<void> {
-  await Promise.all(batch.messages.map(async (message) => {
-    if (isMem0ImportJob(message.body)) {
-      try {
-        await processMem0ImportJob(env, message.body);
-        message.ack();
-      } catch (error) {
-        if (isTransientQueueError(error)) {
-          message.retry();
-          return;
-        }
-        message.ack();
-      }
-      return;
-    }
+  for (const message of batch.messages) await handleMemoryMessage(message, env);
+}
 
-    if (isReclassifyMem0AgentJob(message.body)) {
-      try {
-        await processMem0AgentReclassificationJob(env, message.body);
-        message.ack();
-      } catch (error) {
-        if (isTransientQueueError(error)) {
-          message.retry();
-          return;
-        }
-        message.ack();
-      }
-      return;
-    }
-
-    if (!isMemoryJob(message.body)) {
-      message.ack();
-      return;
-    }
-
+async function handleMemoryMessage(message: Message<MemoryJob>, env: Env): Promise<void> {
+  if (isMem0ImportJob(message.body)) {
     try {
-      const result = await processMemoryJob(env, message.body);
-      if (result === 'inflight') {
-        message.retry();
-        return;
-      }
+      const result = await processMem0ImportJob(env, message.body);
+      if (result === 'inflight') return retryWithBackoff(message);
       message.ack();
     } catch (error) {
-      if (error instanceof TransientMemoryJobError) {
-        message.retry();
-        return;
-      }
+      if (isTransientQueueError(error)) return retryWithBackoff(message);
       message.ack();
     }
-  }));
+    return;
+  }
+
+  if (isReclassifyMem0AgentJob(message.body)) {
+    try {
+      await processMem0AgentReclassificationJob(env, message.body);
+      message.ack();
+    } catch (error) {
+      if (isTransientQueueError(error)) return retryWithBackoff(message);
+      message.ack();
+    }
+    return;
+  }
+
+  if (!isMemoryJob(message.body)) {
+    message.ack();
+    return;
+  }
+
+  try {
+    const result = await processMemoryJob(env, message.body);
+    if (result === 'inflight') return retryWithBackoff(message);
+    message.ack();
+  } catch (error) {
+    if (error instanceof TransientMemoryJobError) return retryWithBackoff(message);
+    message.ack();
+  }
+}
+
+function retryWithBackoff(message: Message<MemoryJob>): void {
+  const attempt = Math.max(1, Number.isFinite(message.attempts) ? message.attempts : 1);
+  message.retry({ delaySeconds: Math.min(300, 15 * (2 ** (attempt - 1))) });
 }
 
 function isTransientQueueError(error: unknown): boolean {
   if (error instanceof TransientMemoryJobError) return true;
-  if (typeof error !== 'object' || error === null || typeof (error as { status?: unknown }).status !== 'number') {
-    return true;
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; status?: unknown; retryable?: unknown; message?: unknown; cause?: unknown };
+  const message = errorMessages(candidate).join(' ');
+  if (candidate.code === 40041 || /\b40041\b|too many requests|vector_upsert_error/i.test(message)) return true;
+  if (candidate.retryable === true) return true;
+  if (typeof candidate.status !== 'number') {
+    return /\b(d1|database|llm|openai|embed(?:ding)?|vector|network|timeout|temporar(?:y|ily)|unavailable)\b/i.test(message);
   }
 
-  const status = (error as { status: number }).status;
+  const status = candidate.status;
   return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function errorMessages(error: { message?: unknown; cause?: unknown }): string[] {
+  const messages = typeof error.message === 'string' ? [error.message] : [];
+  if (typeof error.cause === 'object' && error.cause !== null) {
+    messages.push(...errorMessages(error.cause as { message?: unknown; cause?: unknown }));
+  }
+  return messages;
 }
