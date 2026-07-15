@@ -10,9 +10,13 @@ const dependencies = vi.hoisted(() => ({
 
 vi.mock('../src/db/client', () => ({ createDb: dependencies.createDb }));
 vi.mock('../src/memory/service', () => ({ searchMemories: dependencies.searchMemories }));
-vi.mock('../src/llm', () => ({ reflectWithGraphModel: dependencies.reflectWithGraphModel }));
+vi.mock('../src/llm', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/llm')>(),
+  reflectWithGraphModel: dependencies.reflectWithGraphModel,
+}));
 
-import { reflectMemories } from '../src/reflect/service';
+import { boundedEvidenceCandidates, reflectMemories } from '../src/reflect/service';
+import { GraphLlmConfigurationError, UpstreamServiceError } from '../src/llm';
 
 const env = {} as Env;
 
@@ -33,6 +37,7 @@ const memoryRows = [
 ];
 
 let relationshipPredicates: unknown[] = [];
+let seedLinks = [{ memoryId: 'memory-ada', entityId: 'entity-ada' }];
 
 function createReadOnlyDb() {
   const where = vi.fn((predicate: unknown) => ({ all: vi.fn().mockResolvedValue(rowsFor(predicate)) }));
@@ -45,7 +50,7 @@ function createReadOnlyDb() {
 }
 
 function rowsFor(_predicate: unknown, table?: unknown): unknown[] {
-  if (table === memoryEntityLinks) return [{ memoryId: 'memory-ada', entityId: 'entity-ada' }];
+  if (table === memoryEntityLinks) return seedLinks;
   if (table === relationships) return relationshipRows;
   if (table === entities) return entityRows;
   if (table === memories) return memoryRows.filter((row) => row.userId === 'user-a' && row.deletedAt === null);
@@ -63,11 +68,26 @@ describe('reflectMemories', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     relationshipPredicates = [];
+    seedLinks = [{ memoryId: 'memory-ada', entityId: 'entity-ada' }];
     dependencies.createDb.mockReturnValue(createReadOnlyDb().db);
     dependencies.searchMemories.mockResolvedValue([{ id: 'memory-ada', memory: 'Ada reports to Benoit.', user_id: 'user-a', metadata: {}, created_at: '2026-07-15T00:00:00.000Z', updated_at: '2026-07-15T00:00:00.000Z' }]);
     dependencies.reflectWithGraphModel.mockResolvedValue({
       result: 'Chandra manages Ada through Benoit.', evidence_relation_refs: ['R1', 'R2'],
     });
+  });
+
+  it('keeps evidence candidates seed-first, deduplicated, and within count and character caps', () => {
+    const memory = (id: string, size = 1) => ({
+      id, memory: 'x'.repeat(size), user_id: 'user-a', metadata: {}, created_at: '2026-07-15T00:00:00.000Z', updated_at: '2026-07-15T00:00:00.000Z',
+    });
+
+    expect(boundedEvidenceCandidates(
+      Array.from({ length: 21 }, (_, index) => memory(`seed-${index + 1}`)),
+      [memory('seed-1'), memory('graph-z'), memory('graph-a')],
+    ).map(({ id }) => id)).toEqual(Array.from({ length: 20 }, (_, index) => `seed-${index + 1}`));
+    expect(boundedEvidenceCandidates(
+      Array.from({ length: 13 }, (_, index) => memory(`large-${index + 1}`, 2_000)), [],
+    )).toHaveLength(12);
   });
 
   it('builds a bounded two-hop graph and resolves selected relationship evidence deterministically', async () => {
@@ -132,7 +152,47 @@ describe('reflectMemories', () => {
     });
   });
 
-  it('does not attach cross-user or soft-deleted source memories as evidence', async () => {
+  it.each([
+    ['configuration', new GraphLlmConfigurationError('Missing graph configuration')],
+    ['upstream', new UpstreamServiceError('Graph service unavailable', 503)],
+  ])('propagates %s graph-model failures for route error handling', async (_name, error) => {
+    dependencies.reflectWithGraphModel.mockRejectedValue(error);
+
+    await expect(reflectMemories(env, {
+      query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a',
+    }, 'request-model-error')).rejects.toBe(error);
+  });
+
+  it('caps seed entities at 24 in deterministic ID order before graph mapping', async () => {
+    const extraEntities = Array.from({ length: 25 }, (_, index) => ({
+      id: `entity-seed-${String(index + 1).padStart(2, '0')}`,
+      userId: 'user-a', name: `Seed ${index + 1}`, type: 'person', metadataJson: '{}', createdAt: 1, updatedAt: 1,
+    }));
+    const originalRelationships = [...relationshipRows];
+    entityRows.push(...extraEntities);
+    seedLinks = extraEntities.map((entity) => ({ memoryId: 'memory-ada', entityId: entity.id }));
+    relationshipRows.splice(0, relationshipRows.length, {
+      id: 'relationship-seed', userId: 'user-a', sourceEntityId: 'entity-seed-01', targetEntityId: 'entity-seed-02',
+      relationType: 'knows', confidence: 0, evidenceMemoryId: 'memory-ada', metadataJson: '{}', createdAt: 1, updatedAt: 1,
+    });
+    dependencies.reflectWithGraphModel.mockResolvedValue({ result: 'Seed 1 knows Seed 2.', evidence_relation_refs: ['R1'] });
+    try {
+      await reflectMemories(env, {
+        query: 'Who knows Seed 2?', user_id: 'user-a', agent_id: 'agent-a',
+      }, 'request-cap');
+
+      const graph = dependencies.reflectWithGraphModel.mock.calls[0][1];
+      expect(graph.entities).toHaveLength(24);
+      expect(graph.entities.map((entity: { name: string }) => entity.name)).toEqual(
+        Array.from({ length: 24 }, (_, index) => `Seed ${index + 1}`),
+      );
+    } finally {
+      entityRows.splice(-extraEntities.length);
+      relationshipRows.splice(0, relationshipRows.length, ...originalRelationships);
+    }
+  });
+
+  it('fails closed when selected relationships reference cross-user or soft-deleted source memories', async () => {
     relationshipRows[0] = { ...relationshipRows[0], evidenceMemoryId: 'memory-other-user' };
     relationshipRows[1] = { ...relationshipRows[1], evidenceMemoryId: 'memory-deleted' };
     try {
@@ -140,9 +200,7 @@ describe('reflectMemories', () => {
         query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a',
       }, 'request-isolated');
 
-      expect(result.uncertainty).toBe('medium');
-      expect(result.evidences).toHaveLength(2);
-      expect(result.evidences.every((evidence) => evidence.evidence_memory === undefined)).toBe(true);
+      expect(result).toMatchObject({ uncertainty: 'high', evidences: [], relation_paths: [] });
     } finally {
       relationshipRows[0] = { ...relationshipRows[0], evidenceMemoryId: 'memory-ada' };
       relationshipRows[1] = { ...relationshipRows[1], evidenceMemoryId: 'memory-benoit' };

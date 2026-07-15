@@ -46,7 +46,7 @@ export async function reflectMemories(env: Env, request: ReflectRequest, request
   const seedIds = seeds.map(({ id }) => id);
   const links = await db.select({ memoryId: memoryEntityLinks.memoryId, entityId: memoryEntityLinks.entityId })
     .from(memoryEntityLinks).where(inArray(memoryEntityLinks.memoryId, seedIds)).all();
-  const seedEntityIds = uniqueSorted(links.map(({ entityId }) => entityId));
+  const seedEntityIds = uniqueSorted(links.map(({ entityId }) => entityId)).slice(0, REFLECT_MAX_ENTITIES);
   if (seedEntityIds.length === 0) return noEvidence(requestId);
 
   const byId = new Map<string, EntityRow>();
@@ -85,23 +85,21 @@ export async function reflectMemories(env: Env, request: ReflectRequest, request
     frontier = uniqueSorted([...next]);
   }
   if (accepted.length === 0) return noEvidence(requestId);
+  const evidenceCandidates = await collectEvidenceCandidates(
+    db, request.user_id, seeds, accepted, [...byId.keys()],
+  );
 
   const orderedEntities = [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
   const entityRefs = new Map(orderedEntities.map((entity, index) => [entity.id, `E${index + 1}`]));
   const relationRefs = new Map(accepted.map((edge, index) => [edge.id, `R${index + 1}`]));
-  let reflection: { result: string; evidence_relation_refs: string[] };
-  try {
-    reflection = await reflectWithGraphModel(env, {
-      query: request.query,
-      entities: orderedEntities.map((entity) => ({ ref: entityRefs.get(entity.id)!, name: entity.name, type: entity.type })),
-      relations: accepted.map((edge) => ({
-        ref: relationRefs.get(edge.id)!, source: entityRefs.get(edge.sourceEntityId)!, predicate: edge.relationType,
-        target: entityRefs.get(edge.targetEntityId)!, ...(edge.confidence === null ? {} : { confidence: edge.confidence }),
-      })),
-    });
-  } catch {
-    return noEvidence(requestId);
-  }
+  const reflection = await reflectWithGraphModel(env, {
+    query: request.query,
+    entities: orderedEntities.map((entity) => ({ ref: entityRefs.get(entity.id)!, name: entity.name, type: entity.type })),
+    relations: accepted.map((edge) => ({
+      ref: relationRefs.get(edge.id)!, source: entityRefs.get(edge.sourceEntityId)!, predicate: edge.relationType,
+      target: entityRefs.get(edge.targetEntityId)!, ...(edge.confidence === null ? {} : { confidence: edge.confidence }),
+    })),
+  });
 
   const selectedRefs = reflection.evidence_relation_refs;
   if (selectedRefs.length === 0 || new Set(selectedRefs).size !== selectedRefs.length) return noEvidence(requestId);
@@ -110,8 +108,10 @@ export async function reflectMemories(env: Env, request: ReflectRequest, request
   if (selected.some((edge) => edge === undefined)) return noEvidence(requestId);
 
   const selectedEdges = selected as RelationshipRow[];
-  const evidenceMemories = await loadEvidenceMemories(db, request.user_id, selectedEdges.map(({ evidenceMemoryId }) => evidenceMemoryId));
-  const evidenceById = new Map(evidenceMemories.map((memory) => [memory.id, memory]));
+  const evidenceById = new Map(evidenceCandidates.map((memory) => [memory.id, memory]));
+  if (selectedEdges.some((edge) => edge.evidenceMemoryId !== null && !evidenceById.has(edge.evidenceMemoryId))) {
+    return noEvidence(requestId);
+  }
   return {
     result: reflection.result,
     uncertainty: 'medium',
@@ -147,13 +147,44 @@ async function loadEntities(db: ReturnType<typeof createDb>, userId: string, ids
   return rows.filter((entity) => entity.userId === userId && requested.has(entity.id));
 }
 
-async function loadEvidenceMemories(db: ReturnType<typeof createDb>, userId: string, ids: Array<string | null>): Promise<MemoryResponse[]> {
-  const evidenceIds = uniqueSorted(ids.filter((id): id is string => id !== null));
+async function collectEvidenceCandidates(
+  db: ReturnType<typeof createDb>,
+  userId: string,
+  seeds: MemoryResponse[],
+  edges: RelationshipRow[],
+  entityIds: string[],
+): Promise<MemoryResponse[]> {
+  const links = entityIds.length === 0 ? [] : await db.select({ memoryId: memoryEntityLinks.memoryId })
+    .from(memoryEntityLinks).where(inArray(memoryEntityLinks.entityId, entityIds)).all();
+  const graphMemoryIds = uniqueSorted([
+    ...edges.map(({ evidenceMemoryId }) => evidenceMemoryId).filter((id): id is string => id !== null),
+    ...links.map(({ memoryId }) => memoryId),
+  ]);
+  return boundedEvidenceCandidates(seeds, await loadActiveMemories(db, userId, graphMemoryIds));
+}
+
+async function loadActiveMemories(db: ReturnType<typeof createDb>, userId: string, ids: string[]): Promise<MemoryResponse[]> {
+  const evidenceIds = uniqueSorted(ids);
   if (evidenceIds.length === 0) return [];
   const rows = await db.select().from(memories).where(and(
     inArray(memories.id, evidenceIds), eq(memories.userId, userId), isNull(memories.deletedAt),
   )).all();
   return rows.map(toMemoryResponse);
+}
+
+export function boundedEvidenceCandidates(seeds: MemoryResponse[], graphMemories: MemoryResponse[]): MemoryResponse[] {
+  const candidates = [...seeds, ...[...graphMemories].sort((left, right) => left.id.localeCompare(right.id))];
+  const seen = new Set<string>();
+  const bounded: MemoryResponse[] = [];
+  let characters = 0;
+  for (const memory of candidates) {
+    if (seen.has(memory.id)) continue;
+    seen.add(memory.id);
+    if (bounded.length === REFLECT_MAX_EVIDENCE || characters + memory.memory.length > REFLECT_MAX_EVIDENCE_CHARS) continue;
+    bounded.push(memory);
+    characters += memory.memory.length;
+  }
+  return bounded;
 }
 
 function relationPaths(edges: RelationshipRow[]): Array<{ entity_ids: string[]; relationship_ids: string[] }> {
