@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
 import {
+  GraphModelResponseSchema,
+  ReflectCandidateEvidenceSchema,
+  ReflectRequestSchema,
+} from '../src/reflect/types';
+import {
   embedText,
   extractMemories,
   GraphLlmConfigurationError,
@@ -269,5 +274,80 @@ describe('reflectWithGraphModel', () => {
     ));
 
     await expect(reflectWithGraphModel(graphEnv, input)).rejects.toThrow();
+  });
+
+  it('rejects malformed outer API response JSON', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('not json', { status: 200 })));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toThrow(
+      'Graph LLM reflection response contained invalid JSON',
+    );
+  });
+
+  it('rejects an API response without message content', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: {} }] }), { status: 200 }),
+    ));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toThrow(
+      'Graph LLM reflection response did not contain message content',
+    );
+  });
+
+  it('rejects invalid JSON in message content', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: 'not json' } }] }), { status: 200 }),
+    ));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toThrow(
+      'Graph LLM reflection response contained invalid JSON',
+    );
+  });
+
+  it('rejects a model JSON result missing required fields', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: 'Benoit manages Ada.', uncertainty: 'low',
+      }) } }] }), { status: 200 }),
+    ));
+
+    await expect(reflectWithGraphModel(graphEnv, input)).rejects.toThrow(
+      'Graph LLM reflection response contained an invalid result',
+    );
+  });
+});
+
+describe('graph reflection schemas', () => {
+  it('requires a nonempty query of at most 4000 characters and both identity fields', () => {
+    expect(ReflectRequestSchema.safeParse({
+      query: 'What connects Ada and Chandra?', user_id: 'user-1', agent_id: 'agent-1',
+    }).success).toBe(true);
+    expect(ReflectRequestSchema.safeParse({ query: '', user_id: 'user-1', agent_id: 'agent-1' }).success).toBe(false);
+    expect(ReflectRequestSchema.safeParse({
+      query: 'x'.repeat(4001), user_id: 'user-1', agent_id: 'agent-1',
+    }).success).toBe(false);
+    expect(ReflectRequestSchema.safeParse({ query: 'Question', agent_id: 'agent-1' }).success).toBe(false);
+    expect(ReflectRequestSchema.safeParse({ query: 'Question', user_id: 'user-1' }).success).toBe(false);
+  });
+
+  it('accepts only supported candidate evidence roles', () => {
+    expect(ReflectCandidateEvidenceSchema.safeParse({
+      id: 'memory-1', memory: 'Ada works with Benoit.', role: 'semantic_seed',
+    }).success).toBe(true);
+    expect(ReflectCandidateEvidenceSchema.safeParse({
+      id: 'memory-1', memory: 'Ada works with Benoit.', role: 'unsupported_role',
+    }).success).toBe(false);
+  });
+
+  it('validates optional limitations and limits selected evidence IDs to twenty', () => {
+    expect(GraphModelResponseSchema.safeParse({
+      answer: 'Benoit works with Ada.', uncertainty: 'medium', evidence_ids: ['memory-1'], limitations: 'No manager evidence.',
+    }).success).toBe(true);
+    expect(GraphModelResponseSchema.safeParse({
+      answer: 'Benoit works with Ada.', uncertainty: 'medium', evidence_ids: ['memory-1'], limitations: '',
+    }).success).toBe(false);
+    expect(GraphModelResponseSchema.safeParse({
+      answer: 'Benoit works with Ada.', uncertainty: 'medium', evidence_ids: Array.from({ length: 21 }, (_, index) => `memory-${index}`),
+    }).success).toBe(false);
   });
 });
