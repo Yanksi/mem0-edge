@@ -10,23 +10,36 @@ export const ReflectRequestSchema = z.object({
 
 export const ReflectUncertaintySchema = z.enum(['low', 'medium', 'high']);
 export const GraphThinkingLevelSchema = z.enum(['low', 'medium', 'high']);
-export const ReflectEvidenceRoleSchema = z.enum(['semantic_seed', 'graph_expansion']);
+const GraphEntityRefSchema = z.string().regex(/^E[1-9]\d*$/);
+const GraphRelationRefSchema = z.string().regex(/^R[1-9]\d*$/);
 
-export const ReflectCandidateEvidenceSchema = z.object({
-  id: NonEmptyString,
-  memory: NonEmptyString,
-  role: ReflectEvidenceRoleSchema,
-});
+export const GraphEntitySchema = z.object({
+  ref: GraphEntityRefSchema,
+  name: NonEmptyString,
+  type: NonEmptyString,
+}).strict();
 
-export const GraphModelResponseSchema = z.object({
-  answer: NonEmptyString,
-  uncertainty: ReflectUncertaintySchema,
-  evidence_ids: z.array(NonEmptyString).max(20),
-  limitations: NonEmptyString.optional(),
-});
+export const GraphRelationSchema = z.object({
+  ref: GraphRelationRefSchema,
+  source: GraphEntityRefSchema,
+  predicate: NonEmptyString,
+  target: GraphEntityRefSchema,
+  confidence: z.number().optional(),
+}).strict();
+
+export const GraphReflectionInputSchema = z.object({
+  query: NonEmptyString.max(4000),
+  entities: z.array(GraphEntitySchema),
+  relations: z.array(GraphRelationSchema),
+}).strict();
+
+export const GraphReflectionResultSchema = z.object({
+  result: NonEmptyString.max(4000),
+  evidence_relation_refs: z.array(GraphRelationRefSchema).min(1).max(32)
+    .refine((refs) => new Set(refs).size === refs.length, 'Relation references must be unique'),
+}).strict();
 
 export type ReflectRequest = z.infer<typeof ReflectRequestSchema>;
-export type GraphModelResponse = z.infer<typeof GraphModelResponseSchema>;
 export type GraphThinkingLevel = z.infer<typeof GraphThinkingLevelSchema>;
-export type ReflectEvidenceRole = z.infer<typeof ReflectEvidenceRoleSchema>;
-export type ReflectCandidateEvidence = z.infer<typeof ReflectCandidateEvidenceSchema>;
+export type GraphReflectionInput = z.infer<typeof GraphReflectionInputSchema>;
+export type GraphReflectionResult = z.infer<typeof GraphReflectionResultSchema>;
