@@ -17,8 +17,11 @@ vi.mock('../src/llm', async (importOriginal) => ({
 
 import { boundedEvidenceCandidates, reflectMemories } from '../src/reflect/service';
 import { GraphLlmConfigurationError, UpstreamServiceError } from '../src/llm';
+import worker from '../src/index';
 
 const env = {} as Env;
+const routeEnv = { MEM0_API_KEY: 'test-api-key' } as Env;
+const authorization = { Authorization: 'Bearer test-api-key' };
 
 const entityRows = [
   { id: 'entity-ada', userId: 'user-a', name: 'Ada', type: 'person', metadataJson: '{}', createdAt: 1, updatedAt: 1 },
@@ -205,5 +208,96 @@ describe('reflectMemories', () => {
       relationshipRows[0] = { ...relationshipRows[0], evidenceMemoryId: 'memory-ada' };
       relationshipRows[1] = { ...relationshipRows[1], evidenceMemoryId: 'memory-benoit' };
     }
+  });
+});
+
+describe('reflect route', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    relationshipPredicates = [];
+    seedLinks = [{ memoryId: 'memory-ada', entityId: 'entity-ada' }];
+    dependencies.createDb.mockReturnValue(createReadOnlyDb().db);
+    dependencies.searchMemories.mockResolvedValue([
+      {
+        id: 'memory-ada',
+        memory: 'Ada reports to Benoit.',
+        user_id: 'user-a',
+        metadata: {},
+        created_at: '2026-07-15T00:00:00.000Z',
+        updated_at: '2026-07-15T00:00:00.000Z',
+      },
+    ]);
+    dependencies.reflectWithGraphModel.mockResolvedValue({
+      result: 'Chandra manages Ada through Benoit.',
+      evidence_relation_refs: ['R1', 'R2'],
+    });
+  });
+
+  it('requires API authentication', async () => {
+    const response = await worker.fetch(new Request('https://example.com/v1/reflect', {
+      method: 'POST',
+      body: JSON.stringify({ query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a' }),
+    }), routeEnv);
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
+  });
+
+  it('reflects authenticated requests and logs only operational metadata after the outcome', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const response = await worker.fetch(new Request('https://example.com/v1/reflect', {
+        method: 'POST',
+        headers: authorization,
+        body: JSON.stringify({ query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a' }),
+      }), routeEnv);
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        result: 'Chandra manages Ada through Benoit.',
+        uncertainty: 'medium',
+        request_id: expect.stringMatching(/^[A-Za-z0-9_-]{21}$/),
+      });
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+        event: 'reflect.completed',
+        request_id: expect.stringMatching(/^[A-Za-z0-9_-]{21}$/),
+        user_id: 'user-a',
+        agent_id: 'agent-a',
+        latency_ms: expect.any(Number),
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    ['malformed JSON', '{'],
+    ['invalid payload', JSON.stringify({ query: '', user_id: 'user-a', agent_id: 'agent-a' })],
+  ])('returns validation errors for %s', async (_name, body) => {
+    const response = await worker.fetch(new Request('https://example.com/v1/reflect', {
+      method: 'POST', headers: authorization, body,
+    }), routeEnv);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: 'Validation failed' });
+    expect(dependencies.reflectWithGraphModel).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['configuration', new GraphLlmConfigurationError('Missing graph configuration'), 503, 'Graph reflection is not configured'],
+    ['upstream', new UpstreamServiceError('Graph service unavailable', 503), 502, 'Graph reflection provider request failed'],
+    ['unexpected', new Error('unexpected'), 500, 'Internal server error'],
+  ])('maps %s reflection failures', async (_name, error, status, message) => {
+    dependencies.reflectWithGraphModel.mockRejectedValueOnce(error);
+
+    const response = await worker.fetch(new Request('https://example.com/v1/reflect', {
+      method: 'POST',
+      headers: authorization,
+      body: JSON.stringify({ query: 'Who manages Ada?', user_id: 'user-a', agent_id: 'agent-a' }),
+    }), routeEnv);
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toEqual({ error: message });
   });
 });

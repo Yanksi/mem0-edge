@@ -5,6 +5,7 @@ import { dashboardRoutes } from './routes/dashboard';
 import { entitiesRoutes, relationshipsRoutes } from './routes/entities';
 import { hermesRoutes } from './routes/hermes';
 import { memoriesRoutes } from './routes/memories';
+import { reflectRoutes } from './routes/reflect';
 
 export const app = new Hono<{ Bindings: Env }>();
 
@@ -16,6 +17,7 @@ app.route('/v1/memories', memoriesRoutes);
 app.route('/v1', hermesRoutes);
 app.route('/v1/entities', entitiesRoutes);
 app.route('/v1/relationships', relationshipsRoutes);
+app.route('/v1/reflect', reflectRoutes);
 
 export default {
   fetch: app.fetch,

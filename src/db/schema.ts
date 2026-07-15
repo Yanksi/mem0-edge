@@ -103,6 +103,8 @@ export const relationships = sqliteTable(
     updatedAt,
   },
   (table) => [
+    index('relationships_user_source_idx').on(table.userId, table.sourceEntityId),
+    index('relationships_user_target_idx').on(table.userId, table.targetEntityId),
     index('relationships_source_entity_idx').on(table.sourceEntityId),
     index('relationships_target_entity_idx').on(table.targetEntityId),
     index('relationships_evidence_memory_idx').on(table.evidenceMemoryId),

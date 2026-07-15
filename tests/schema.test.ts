@@ -9,6 +9,8 @@ import idempotencyRequestsMigration from '../src/migrations/0002_idempotency_req
 import memoryRequestLeasesMigration from '../src/migrations/0003_memory_request_leases.sql?raw';
 // @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
 import agentScopedMemoriesMigration from '../src/migrations/0004_agent_scoped_memories.sql?raw';
+// @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
+import reflectGraphIndexesMigration from '../src/migrations/0005_reflect_graph_indexes.sql?raw';
 import {
   apiKeys,
   entities,
@@ -66,6 +68,22 @@ describe('database schema', () => {
         name: 'memory_requests_status_updated_at_idx',
         unique: false,
       }),
+    );
+  });
+
+  it('declares owner-scoped relationship traversal indexes in the schema and migration', () => {
+    const indexes = getTableConfig(relationships).indexes.map((index) => index.config);
+
+    expect(indexes).toContainEqual(expect.objectContaining({
+      name: 'relationships_user_source_idx',
+      unique: false,
+    }));
+    expect(indexes).toContainEqual(expect.objectContaining({
+      name: 'relationships_user_target_idx',
+      unique: false,
+    }));
+    expect(reflectGraphIndexesMigration).toBe(
+      'CREATE INDEX relationships_user_source_idx ON relationships (user_id, source_entity_id);\nCREATE INDEX relationships_user_target_idx ON relationships (user_id, target_entity_id);\n',
     );
   });
 
