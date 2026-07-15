@@ -31,7 +31,46 @@ export const GraphReflectionInputSchema = z.object({
   query: NonEmptyString.max(4000),
   entities: z.array(GraphEntitySchema),
   relations: z.array(GraphRelationSchema),
-}).strict();
+}).strict().superRefine((graph, context) => {
+  const entityRefs = new Set<string>();
+  graph.entities.forEach((entity, index) => {
+    if (entityRefs.has(entity.ref)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['entities', index, 'ref'],
+        message: 'Entity references must be unique',
+      });
+    }
+    entityRefs.add(entity.ref);
+  });
+
+  const relationRefs = new Set<string>();
+  graph.relations.forEach((relation, index) => {
+    if (relationRefs.has(relation.ref)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['relations', index, 'ref'],
+        message: 'Relation references must be unique',
+      });
+    }
+    relationRefs.add(relation.ref);
+
+    if (!entityRefs.has(relation.source)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['relations', index, 'source'],
+        message: 'Relation source must reference an entity',
+      });
+    }
+    if (!entityRefs.has(relation.target)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['relations', index, 'target'],
+        message: 'Relation target must reference an entity',
+      });
+    }
+  });
+});
 
 export const GraphReflectionResultSchema = z.object({
   result: NonEmptyString.max(4000),
