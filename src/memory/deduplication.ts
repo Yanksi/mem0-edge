@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, or } from 'drizzle-orm';
 import { createDb } from '../db/client';
 import { memories } from '../db/schema';
 import type { Env } from '../env';
@@ -34,26 +34,25 @@ export async function findActiveExactMemory(
     exclusion,
   ];
 
-  const [hashedMatch] = await db.select()
+  const [match] = await db.select()
     .from(memories)
-    .where(and(...common, eq(memories.contentHash, resolvedDigest)))
+    .where(and(
+      ...common,
+      or(eq(memories.contentHash, resolvedDigest), isNull(memories.contentHash)),
+    ))
+    .orderBy(asc(memories.createdAt), asc(memories.id))
     .limit(1);
-  if (hashedMatch !== undefined) {
-    return hashedMatch;
-  }
-
-  const [phaseOneMatch] = await db.select()
-    .from(memories)
-    .where(and(...common, isNull(memories.contentHash)))
-    .limit(1);
-  if (phaseOneMatch === undefined) {
+  if (match === undefined) {
     return undefined;
+  }
+  if (match.contentHash !== null) {
+    return match;
   }
 
   const [backfilled] = await db.update(memories)
     .set({ contentHash: resolvedDigest })
     .where(and(
-      eq(memories.id, phaseOneMatch.id),
+      eq(memories.id, match.id),
       ...common,
       isNull(memories.contentHash),
     ))
@@ -65,7 +64,7 @@ export async function findActiveExactMemory(
   const [concurrentMatch] = await db.select()
     .from(memories)
     .where(and(
-      eq(memories.id, phaseOneMatch.id),
+      eq(memories.id, match.id),
       isNull(memories.deletedAt),
       ownerPredicate(scope),
       eq(memories.content, content),
@@ -118,17 +117,21 @@ export async function prepareMemoryWrite(
       ownerPredicate(scope),
     ));
   const rowsById = new Map(rows.map((row) => [row.id, row]));
-  const candidates = matches.flatMap(({ id }) => {
+  const candidates = matches.flatMap(({ id, score }) => {
     const row = rowsById.get(id);
-    return row === undefined ? [] : [row];
-  });
+    return row === undefined ? [] : [{ row, score }];
+  }).sort((left, right) => (
+    right.score - left.score
+    || left.row.createdAt - right.row.createdAt
+    || (left.row.id < right.row.id ? -1 : left.row.id > right.row.id ? 1 : 0)
+  ));
 
   if (candidates.length === 0) {
     return { contentHash: digest, exactScopeKey, embedding };
   }
 
   const refs = new Map<string, MemoryRow>();
-  const llmCandidates = candidates.map((row, index) => {
+  const llmCandidates = candidates.map(({ row }, index) => {
     const ref = `M${index + 1}`;
     refs.set(ref, row);
     return { ref, text: row.content };

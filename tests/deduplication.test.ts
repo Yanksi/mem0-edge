@@ -118,6 +118,67 @@ describe('findActiveExactMemory', () => {
     ).bind('memory-null-hash').first()).resolves.toEqual({ content_hash: digest });
   });
 
+  it('uses one ordered lookup for matching and phase-one hashes', async () => {
+    const content = 'The launch date is October 8.';
+    const digest = await contentHash(content);
+    const lookupQueries: string[] = [];
+    await seedMemory({
+      id: 'memory-null-hash',
+      content,
+      userId: 'user-1',
+      contentHash: null,
+    });
+    const observedEnv = withPreparedQueryObserver((query) => {
+      if (query.startsWith('select') && query.includes('from "memories"')) {
+        lookupQueries.push(query);
+      }
+    });
+
+    await findActiveExactMemory(
+      observedEnv,
+      { userId: 'user-1', agentId: null },
+      content,
+      digest,
+    );
+
+    expect(lookupQueries).toHaveLength(1);
+    expect(lookupQueries[0]).toContain(
+      '("memories"."content_hash" = ? or "memories"."content_hash" is null)',
+    );
+    expect(lookupQueries[0]).toContain(
+      'order by "memories"."created_at" asc, "memories"."id" asc limit ?',
+    );
+  });
+
+  it('canonically selects the oldest row across mixed matching and null hashes', async () => {
+    const content = 'The launch date is October 8.';
+    const digest = await contentHash(content);
+    await seedMemory({
+      id: 'newer-hashed',
+      content,
+      userId: 'user-1',
+      contentHash: digest,
+      createdAt: 20,
+    });
+    await seedMemory({
+      id: 'older-null',
+      content,
+      userId: 'user-1',
+      contentHash: null,
+      createdAt: 10,
+    });
+
+    await expect(findActiveExactMemory(
+      env,
+      { userId: 'user-1', agentId: null },
+      content,
+      digest,
+    )).resolves.toMatchObject({ id: 'older-null', contentHash: digest });
+    await expect(env.DB.prepare(
+      'SELECT content_hash FROM memories WHERE id = ?',
+    ).bind('older-null').first()).resolves.toEqual({ content_hash: digest });
+  });
+
   it.each([
     ['deleted', 'UPDATE memories SET deleted_at = ? WHERE id = ?', { deleted_at: 12 }],
     ['moved to another owner', 'UPDATE memories SET user_id = ? WHERE id = ?', { user_id: 'user-2' }],
@@ -326,7 +387,7 @@ describe('prepareMemoryWrite', () => {
 
     await prepareMemoryWrite(configuredEnv(), scope, 'Brand new memory');
 
-    expect(dependencies.selectSemanticDuplicate).toHaveBeenCalledWith(expect.anything(), {
+    expect(dependencies.selectSemanticDuplicate.mock.calls[0][1]).toEqual({
       new_memory: { ref: 'NEW', text: 'Brand new memory' },
       candidates: [
         { ref: 'M1', text: 'Second survivor' },
@@ -337,6 +398,48 @@ describe('prepareMemoryWrite', () => {
     expect(JSON.stringify(input)).not.toContain('score');
     expect(JSON.stringify(input)).not.toContain('survivor-one');
     expect(JSON.stringify(input)).not.toContain('createdAt');
+  });
+
+  it('orders equal-score semantic candidates by creation time before assigning refs', async () => {
+    const scope = { userId: 'user-1', agentId: null };
+    dependencies.getSemanticDedupEnabled.mockResolvedValue(true);
+    dependencies.searchDeduplicationCandidates.mockResolvedValue([
+      { id: 'created-later', score: 0.9 },
+      { id: 'created-earlier', score: 0.9 },
+    ]);
+    await seedMemory({ id: 'created-later', content: 'Created later', ...scope, createdAt: 20 });
+    await seedMemory({ id: 'created-earlier', content: 'Created earlier', ...scope, createdAt: 10 });
+
+    await prepareMemoryWrite(configuredEnv(), scope, 'Brand new memory');
+
+    expect(dependencies.selectSemanticDuplicate.mock.calls[0][1]).toEqual({
+      new_memory: { ref: 'NEW', text: 'Brand new memory' },
+      candidates: [
+        { ref: 'M1', text: 'Created earlier' },
+        { ref: 'M2', text: 'Created later' },
+      ],
+    });
+  });
+
+  it('orders equal-score and equal-time semantic candidates by ID before assigning refs', async () => {
+    const scope = { userId: 'user-1', agentId: null };
+    dependencies.getSemanticDedupEnabled.mockResolvedValue(true);
+    dependencies.searchDeduplicationCandidates.mockResolvedValue([
+      { id: 'candidate-z', score: 0.9 },
+      { id: 'candidate-a', score: 0.9 },
+    ]);
+    await seedMemory({ id: 'candidate-z', content: 'Candidate Z', ...scope, createdAt: 10 });
+    await seedMemory({ id: 'candidate-a', content: 'Candidate A', ...scope, createdAt: 10 });
+
+    await prepareMemoryWrite(configuredEnv(), scope, 'Brand new memory');
+
+    expect(dependencies.selectSemanticDuplicate.mock.calls[0][1]).toEqual({
+      new_memory: { ref: 'NEW', text: 'Brand new memory' },
+      candidates: [
+        { ref: 'M1', text: 'Candidate A' },
+        { ref: 'M2', text: 'Candidate Z' },
+      ],
+    });
   });
 
   it('returns the selected full D1 row and preserves the generated embedding', async () => {
@@ -478,6 +581,18 @@ function withMutationBeforeBackfill(mutate: () => Promise<void>): Env {
         },
       };
       return wrappedStatement as unknown as D1PreparedStatement;
+    },
+  } as unknown as D1Database;
+
+  return { ...env, DB: wrappedDatabase };
+}
+
+function withPreparedQueryObserver(observe: (query: string) => void): Env {
+  const database = env.DB;
+  const wrappedDatabase = {
+    prepare(query: string) {
+      observe(query);
+      return database.prepare(query);
     },
   } as unknown as D1Database;
 
