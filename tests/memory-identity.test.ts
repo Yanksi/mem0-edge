@@ -6,6 +6,7 @@ import {
   memoryVectorMetadata,
   ownerPredicate,
   scopeKey,
+  vectorStateHash,
   type MemoryOwnerScope,
 } from '../src/memory/identity';
 
@@ -66,6 +67,7 @@ describe('memory identity', () => {
         scope_key: 'spoofed-scope',
         content_hash: 'spoofed-content-digest',
         memory_vector_schema: 'spoofed-schema',
+        vector_state_hash: 'spoofed-state',
       }),
     };
 
@@ -79,7 +81,36 @@ describe('memory identity', () => {
       scope_key: await scopeKey(row),
       content_hash: 'content-digest',
       memory_vector_schema: '1',
+      vector_state_hash: await vectorStateHash(row),
     });
+  });
+
+  it('hashes the exact full vector source tuple and changes for metadata, run, or actor drift', async () => {
+    const row = {
+      userId: 'user-1',
+      agentId: 'agent-1',
+      runId: 'run-1',
+      actorId: 'actor-1',
+      metadataJson: '{"b":2,"a":1}',
+      contentHash: 'content-digest',
+    };
+
+    await expect(vectorStateHash(row)).resolves.toBe(
+      await sha256Tuple([
+        row.userId,
+        row.agentId,
+        row.runId,
+        row.actorId,
+        row.metadataJson,
+        row.contentHash,
+      ]),
+    );
+    await expect(Promise.all([
+      vectorStateHash(row),
+      vectorStateHash({ ...row, metadataJson: '{"a":1,"b":2}' }),
+      vectorStateHash({ ...row, runId: 'run-2' }),
+      vectorStateHash({ ...row, actorId: 'actor-2' }),
+    ])).resolves.toSatisfy((hashes: string[]) => new Set(hashes).size === 4);
   });
 
   it.each(['not-json', '[]', 'null'])('safely ignores non-object metadata JSON %s', async (metadataJson) => {
@@ -96,6 +127,13 @@ describe('memory identity', () => {
       scope_key: await scopeKey(scope),
       content_hash: 'content-digest',
       memory_vector_schema: '1',
+      vector_state_hash: await vectorStateHash({
+        ...scope,
+        runId: null,
+        actorId: null,
+        contentHash: 'content-digest',
+        metadataJson,
+      }),
     });
   });
 
@@ -115,6 +153,7 @@ describe('memory identity', () => {
         scope_key: 'spoofed-scope',
         content_hash: 'spoofed-content-digest',
         memory_vector_schema: 'spoofed-schema',
+        vector_state_hash: 'spoofed-state',
       }),
     };
 
@@ -123,6 +162,13 @@ describe('memory identity', () => {
       scope_key: await scopeKey(row),
       content_hash: 'content-digest',
       memory_vector_schema: '1',
+      vector_state_hash: await vectorStateHash(row),
     });
   });
 });
+
+async function sha256Tuple(tuple: unknown[]): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(tuple));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}

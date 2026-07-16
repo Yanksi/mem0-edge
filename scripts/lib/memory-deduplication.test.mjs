@@ -29,6 +29,7 @@ import {
   reindexActiveMemories,
   resolveAccountId,
   validateEnvironment,
+  vectorStateHash,
   verifyMemoryState,
 } from '../migrate-memory-deduplication.mjs';
 
@@ -50,6 +51,11 @@ const TEST_WRANGLER_CONFIG = `
 `;
 
 async function artifactSource(rows, config = TEST_CONFIG) {
+  for (const row of rows) {
+    if (!Object.hasOwn(row, 'run_id')) row.run_id = null;
+    if (!Object.hasOwn(row, 'actor_id')) row.actor_id = null;
+    if (!Object.hasOwn(row, 'metadata_json')) row.metadata_json = '{}';
+  }
   return JSON.stringify(await createInspectionArtifact({
     rows: structuredClone(rows),
     config,
@@ -87,6 +93,16 @@ test('scopeKey distinguishes every null and value owner combination', async () =
 
   assert.deepEqual(actual, expected);
   assert.equal(new Set(actual).size, owners.length);
+});
+
+test('vectorStateHash uses the exact maintenance D1 source tuple', async () => {
+  const row = {
+    user_id: 'user-1', agent_id: 'agent-1', run_id: 'run-1', actor_id: 'actor-1',
+    metadata_json: '{"b":2,"a":1}', content_hash: 'content-digest',
+  };
+  assert.equal(await vectorStateHash(row), await sha256Hex(JSON.stringify([
+    row.user_id, row.agent_id, row.run_id, row.actor_id, row.metadata_json, row.content_hash,
+  ])));
 });
 
 test('duplicateMappings separates owner scopes and ignores deleted rows', () => {
@@ -232,7 +248,10 @@ function successfulD1Result(results = [], changes = 0) {
   return [{ success: true, results, meta: { changes } }];
 }
 
-async function createStatefulMaintenanceFake(failurePhase) {
+async function createStatefulMaintenanceFake(failurePhase, {
+  loserExternallyDeleted = false,
+  forceIncompleteGraphAudit = false,
+} = {}) {
   const rows = [
     {
       id: 'canonical',
@@ -271,6 +290,18 @@ async function createStatefulMaintenanceFake(failurePhase) {
       deleted_at: 50,
     },
   ];
+  if (loserExternallyDeleted) {
+    for (const row of rows) row.content_hash = await contentHash(row.content);
+  }
+  const artifact = await artifactSource(rows);
+  if (loserExternallyDeleted) {
+    rows.find(({ id }) => id === 'loser').deleted_at = 75;
+  }
+  const entityLinks = new Map([
+    ['canonical', new Set()],
+    ['loser', new Set(['entity-1'])],
+  ]);
+  const relationships = [{ id: 'relationship-1', evidence_memory_id: 'loser' }];
   const vectors = new Map(rows.map((row) => [
     row.id,
     { id: row.id, metadata: { scope_key: 'stale' } },
@@ -281,6 +312,7 @@ async function createStatefulMaintenanceFake(failurePhase) {
     vectorDeleteSubmissions: [],
     reindexSuccesses: [],
     indexInfoCalls: 0,
+    graphAuditCalls: 0,
   };
   let pendingFailure = failurePhase;
   let loginCount = 0;
@@ -330,6 +362,21 @@ async function createStatefulMaintenanceFake(failurePhase) {
           && loser.agent_id === canonical.agent_id
           && loser.content_hash === canonical.content_hash
           && loser.content === canonical.content;
+        const exactPair = canonical?.deleted_at === null
+          && loser !== undefined
+          && loser.user_id === canonical.user_id
+          && loser.agent_id === canonical.agent_id
+          && loser.content_hash === canonical.content_hash
+          && loser.content === canonical.content;
+        const graphGuardRequiresActiveLoser = /loser\.deleted_at IS NULL/i.test(body.batch[0].sql);
+        if (exactPair && (!graphGuardRequiresActiveLoser || loser.deleted_at === null)) {
+          for (const entityId of entityLinks.get(loserId) ?? []) {
+            entityLinks.get(canonicalId).add(entityId);
+          }
+          for (const relationship of relationships) {
+            if (relationship.evidence_memory_id === loserId) relationship.evidence_memory_id = canonicalId;
+          }
+        }
         if (decisive) {
           loser.deleted_at = 100;
           stats.cleanupCommits += 1;
@@ -346,6 +393,32 @@ async function createStatefulMaintenanceFake(failurePhase) {
               meta: { changes: decisive ? 1 : 0 },
             },
           ],
+        });
+      }
+
+      if (body.batch?.[0]?.sql.includes('relationship_evidence_count')) {
+        stats.graphAuditCalls += 1;
+        return jsonResponse({
+          success: true,
+          result: body.batch.map((statement) => {
+            const [canonicalId, loserId] = statement.params;
+            const relationshipEvidenceCount = relationships.filter(({ evidence_memory_id }) => (
+              evidence_memory_id === loserId
+            )).length;
+            const missingCanonicalLinkCount = [...(entityLinks.get(loserId) ?? [])].filter((entityId) => (
+              !entityLinks.get(canonicalId)?.has(entityId)
+            )).length;
+            return {
+              success: true,
+              results: [{
+                canonical_id: canonicalId,
+                loser_id: loserId,
+                relationship_evidence_count: forceIncompleteGraphAudit ? 1 : relationshipEvidenceCount,
+                missing_canonical_link_count: missingCanonicalLinkCount,
+              }],
+              meta: { changes: 0 },
+            };
+          }),
         });
       }
 
@@ -394,6 +467,7 @@ async function createStatefulMaintenanceFake(failurePhase) {
         scope_key: await scopeKey(row),
         content_hash: row.content_hash,
         memory_vector_schema: '1',
+        vector_state_hash: await vectorStateHash(row),
       } });
       stats.reindexSuccesses.push(id);
       return jsonResponse({ ok: true, mutation_id: nextMutationId() });
@@ -402,7 +476,7 @@ async function createStatefulMaintenanceFake(failurePhase) {
     throw new Error(`unexpected request: ${url}`);
   };
 
-  return { rows, vectors, stats, fetchImpl, artifact: await artifactSource(rows) };
+  return { rows, vectors, entityLinks, relationships, stats, fetchImpl, artifact };
 }
 
 function statefulMaintenanceOptions(fake, logs, errors) {
@@ -445,14 +519,15 @@ test('inspection artifacts have a deterministic schema and reject malformed, cor
     mem0BaseUrl: 'https://mem0.example',
   };
   const rows = [{
-    id: 'memory-1', user_id: 'user-1', agent_id: null, content: 'exact',
+    id: 'memory-1', user_id: 'user-1', agent_id: null,
+    run_id: 'run-1', actor_id: 'actor-1', metadata_json: '{"label":"exact"}', content: 'exact',
     content_hash: null, created_at: 1, deleted_at: null,
   }];
   const createdAt = new Date('2026-07-16T12:34:56.000Z');
   const first = await createInspectionArtifact({ rows, config, createdAt });
   const second = await createInspectionArtifact({ rows: structuredClone(rows), config: { ...config }, createdAt });
   assert.deepEqual(first, second);
-  assert.equal(first.artifact_schema, 'memory-deduplication-inspection/v1');
+  assert.equal(first.artifact_schema, 'memory-deduplication-inspection/v2');
   assert.deepEqual(first.target, {
     account_id: 'account-1',
     database_id: 'database-1',
@@ -460,6 +535,9 @@ test('inspection artifacts have a deterministic schema and reject malformed, cor
     mem0_base_url: 'https://mem0.example',
   });
   assert.deepEqual(first.mappings, []);
+  assert.equal(first.rows[0].run_id, 'run-1');
+  assert.equal(first.rows[0].actor_id, 'actor-1');
+  assert.equal(first.rows[0].metadata_json, '{"label":"exact"}');
   assert.match(first.integrity.fingerprint, /^[0-9a-f]{64}$/);
   await assert.doesNotReject(validateInspectionArtifact(JSON.stringify(first), config));
   await assert.rejects(validateInspectionArtifact('{not-json', config), /invalid JSON/);
@@ -467,6 +545,10 @@ test('inspection artifacts have a deterministic schema and reject malformed, cor
   const corrupt = structuredClone(first);
   corrupt.rows[0].content = 'changed';
   await assert.rejects(validateInspectionArtifact(JSON.stringify(corrupt), config), /integrity fingerprint mismatch/);
+  await assert.rejects(
+    createInspectionArtifact({ rows: [{ ...rows[0], metadata_json: undefined }], config, createdAt }),
+    /inspection artifact rows are invalid/,
+  );
   await assert.rejects(validateInspectionArtifact(JSON.stringify(first), {
     ...config,
     databaseId: 'other-database',
@@ -481,9 +563,9 @@ test('artifact state validation accepts only inspected or artifact-reachable par
     vectorizeIndexName: 'memory-index', mem0BaseUrl: 'https://mem0.example',
   };
   const rows = [
-    { id: 'canonical', user_id: 'u', agent_id: null, content: 'same', content_hash: null, created_at: 1, deleted_at: null },
-    { id: 'loser', user_id: 'u', agent_id: null, content: 'same', content_hash: null, created_at: 2, deleted_at: null },
-    { id: 'other', user_id: null, agent_id: 'a', content: 'other', content_hash: null, created_at: 3, deleted_at: null },
+    { id: 'canonical', user_id: 'u', agent_id: null, run_id: 'r1', actor_id: 'a1', metadata_json: '{"v":1}', content: 'same', content_hash: null, created_at: 1, deleted_at: null },
+    { id: 'loser', user_id: 'u', agent_id: null, run_id: 'r2', actor_id: 'a2', metadata_json: '{"v":2}', content: 'same', content_hash: null, created_at: 2, deleted_at: null },
+    { id: 'other', user_id: null, agent_id: 'a', run_id: null, actor_id: null, metadata_json: '{}', content: 'other', content_hash: null, created_at: 3, deleted_at: null },
   ];
   const artifact = await createInspectionArtifact({ rows, config, createdAt: new Date('2026-07-16T12:00:00Z') });
   assert.deepEqual(artifact.mappings, [{ canonicalId: 'canonical', loserId: 'loser' }]);
@@ -506,6 +588,15 @@ test('artifact state validation accepts only inspected or artifact-reachable par
   await assert.rejects(validateApplyState(artifact, rows.map((row) => (
     row.id === 'canonical' ? { ...row, content: 'changed content' } : row
   ))), /memory canonical changed content/);
+  for (const [field, value] of [
+    ['run_id', 'changed-run'],
+    ['actor_id', 'changed-actor'],
+    ['metadata_json', '{"v":"changed"}'],
+  ]) {
+    await assert.rejects(validateApplyState(artifact, rows.map((row) => (
+      row.id === 'canonical' ? { ...row, [field]: value } : row
+    ))), new RegExp(`memory canonical changed ${field}`));
+  }
   await assert.rejects(validateApplyState(artifact, rows.map((row) => (
     row.id === 'other' ? { ...row, deleted_at: 100 } : row
   ))), /memory other has an unplanned deletion transition/);
@@ -746,18 +837,25 @@ test('waitForVectorMutation polls until equality and fails on its bounded timeou
 });
 
 test('pendingReindexRows batches active vector reads and skips only fully converged rows', async () => {
-  const { pendingReindexRows } = await import('../migrate-memory-deduplication.mjs');
+  const { pendingReindexRows, vectorStateHash } = await import('../migrate-memory-deduplication.mjs');
   assert.equal(typeof pendingReindexRows, 'function');
+  assert.equal(typeof vectorStateHash, 'function');
   const rows = await Promise.all([
-    ['ready', 'ready'],
-    ['missing', 'missing'],
-    ['wrong-hash', 'hash'],
-    ['wrong-schema', 'schema'],
-    ['wrong-scope', 'scope'],
-  ].map(async ([id, content]) => ({
+    ['ready', 'ready', 'run-1', 'actor-1', '{"label":"ready"}'],
+    ['missing', 'missing', null, null, '{}'],
+    ['wrong-hash', 'hash', null, null, '{}'],
+    ['wrong-schema', 'schema', null, null, '{}'],
+    ['wrong-scope', 'scope', null, null, '{}'],
+    ['wrong-metadata', 'same-content', 'run-1', 'actor-1', '{"label":"new"}'],
+    ['wrong-run', 'same-content', 'run-new', 'actor-1', '{"label":"same"}'],
+    ['wrong-actor', 'same-content', 'run-1', 'actor-new', '{"label":"same"}'],
+  ].map(async ([id, content, run_id, actor_id, metadata_json]) => ({
     id,
     user_id: 'user-1',
     agent_id: null,
+    run_id,
+    actor_id,
+    metadata_json,
     content,
     content_hash: await contentHash(content),
     created_at: 1,
@@ -770,12 +868,22 @@ test('pendingReindexRows batches active vector reads and skips only fully conver
       scope_key: await scopeKey(row),
       content_hash: row.content_hash,
       memory_vector_schema: '1',
+      vector_state_hash: await vectorStateHash(row),
     },
   }])));
   vectors.delete('missing');
   vectors.get('wrong-hash').metadata.content_hash = 'stale';
   vectors.get('wrong-schema').metadata.memory_vector_schema = '0';
   vectors.get('wrong-scope').metadata.scope_key = 'stale';
+  vectors.get('wrong-metadata').metadata.vector_state_hash = await vectorStateHash({
+    ...rows.find(({ id }) => id === 'wrong-metadata'), metadata_json: '{"label":"old"}',
+  });
+  vectors.get('wrong-run').metadata.vector_state_hash = await vectorStateHash({
+    ...rows.find(({ id }) => id === 'wrong-run'), run_id: 'run-old',
+  });
+  vectors.get('wrong-actor').metadata.vector_state_hash = await vectorStateHash({
+    ...rows.find(({ id }) => id === 'wrong-actor'), actor_id: 'actor-old',
+  });
 
   const pending = await pendingReindexRows({
     rows,
@@ -786,8 +894,14 @@ test('pendingReindexRows batches active vector reads and skips only fully conver
     },
   });
 
-  assert.deepEqual(calls, [['ready', 'missing'], ['wrong-hash', 'wrong-schema'], ['wrong-scope']]);
-  assert.deepEqual(pending.map(({ id }) => id), ['missing', 'wrong-hash', 'wrong-schema', 'wrong-scope']);
+  assert.deepEqual(calls, [
+    ['ready', 'missing'], ['wrong-hash', 'wrong-schema'], ['wrong-scope', 'wrong-metadata'],
+    ['wrong-run', 'wrong-actor'],
+  ]);
+  assert.deepEqual(pending.map(({ id }) => id), [
+    'missing', 'wrong-hash', 'wrong-schema', 'wrong-scope',
+    'wrong-metadata', 'wrong-run', 'wrong-actor',
+  ]);
 });
 
 test('Cloudflare D1 client rejects an unsuccessful nested query result', async () => {
@@ -842,6 +956,7 @@ test('pageAllMemories uses deterministic keyset pagination including deleted row
 
   assert.deepEqual(rows.map(({ id }) => id), ['a', 'b', 'c']);
   assert.match(calls[0].sql, /ORDER BY created_at ASC, id ASC\s+LIMIT \?/i);
+  assert.match(calls[0].sql, /run_id, actor_id, metadata_json/i);
   assert.doesNotMatch(calls[0].sql, /deleted_at IS NULL/i);
   assert.deepEqual(calls[0].params, [2]);
   assert.match(calls[1].sql, /created_at > \? OR \(created_at = \? AND id > \?\)/i);
@@ -877,6 +992,9 @@ test('inspect is read-only and writes a deterministic backup without configured 
             id: 'memory-1',
             user_id: 'user-1',
             agent_id: null,
+            run_id: null,
+            actor_id: null,
+            metadata_json: '{}',
             content: 'safe content',
             content_hash: await contentHash('safe content'),
             created_at: 1,
@@ -886,6 +1004,9 @@ test('inspect is read-only and writes a deterministic backup without configured 
             id: 'memory-2',
             user_id: 'user-1',
             agent_id: null,
+            run_id: null,
+            actor_id: null,
+            metadata_json: '{}',
             content: 'safe content',
             content_hash: await contentHash('safe content'),
             created_at: 2,
@@ -895,6 +1016,9 @@ test('inspect is read-only and writes a deterministic backup without configured 
             id: 'ownerless',
             user_id: null,
             agent_id: null,
+            run_id: null,
+            actor_id: null,
+            metadata_json: '{}',
             content: 'cannot reindex',
             content_hash: await contentHash('cannot reindex'),
             created_at: 3,
@@ -1220,6 +1344,8 @@ test('cleanupDuplicate uses one guarded D1 batch and reports only a decisive sof
   assert.equal(sent.batch.length, 3);
   assert.match(sent.batch[0].sql, /INSERT OR IGNORE INTO memory_entity_links/i);
   assert.match(sent.batch[1].sql, /UPDATE relationships\s+SET evidence_memory_id = \?/i);
+  assert.doesNotMatch(sent.batch[0].sql, /loser\.deleted_at IS NULL/i);
+  assert.doesNotMatch(sent.batch[1].sql, /loser\.deleted_at IS NULL/i);
   assert.match(sent.batch[2].sql, /SET deleted_at = unixepoch\(\)/i);
   for (const statement of sent.batch) {
     assert.doesNotMatch(statement.sql, /canonical-danger|loser-danger/);
@@ -1234,6 +1360,36 @@ test('cleanupDuplicate uses one guarded D1 batch and reports only a decisive sof
       { success: true, results: [] },
     ],
   }), false);
+});
+
+test('apply repairs graph references for a planned loser soft-deleted after inspect', async () => {
+  const fake = await createStatefulMaintenanceFake(undefined, { loserExternallyDeleted: true });
+  const logs = [];
+  const errors = [];
+
+  assert.equal(await main(
+    ['apply', '--confirm', 'backups/inspection.json'],
+    statefulMaintenanceOptions(fake, logs, errors),
+  ), 0);
+  assert.equal(fake.relationships[0].evidence_memory_id, 'canonical');
+  assert.deepEqual([...fake.entityLinks.get('canonical')], ['entity-1']);
+  assert.equal(fake.stats.graphAuditCalls, 1);
+  assert.deepEqual(errors, []);
+});
+
+test('apply fails before vectors when planned mapping graph convergence is incomplete', async () => {
+  const fake = await createStatefulMaintenanceFake(undefined, { forceIncompleteGraphAudit: true });
+  const logs = [];
+  const errors = [];
+
+  assert.equal(await main(
+    ['apply', '--confirm', 'backups/inspection.json'],
+    statefulMaintenanceOptions(fake, logs, errors),
+  ), 1);
+  assert.match(errors[0], /graph convergence is incomplete.*loser/i);
+  assert.deepEqual(fake.stats.vectorDeleteSubmissions, []);
+  assert.deepEqual(fake.stats.reindexSuccesses, []);
+  assert.deepEqual(logs, []);
 });
 
 test('deleteVectorIds uses bounded batches and preserves call order', async () => {
@@ -1485,10 +1641,14 @@ test('verifyMemoryState batches active and deleted vector reads and reports ever
 });
 
 test('verifyMemoryState succeeds when hashes, exact groups, vectors, and scope metadata are complete', async () => {
+  const { vectorStateHash } = await import('../migrate-memory-deduplication.mjs');
   const row = {
     id: 'ready',
     user_id: 'u',
     agent_id: 'a',
+    run_id: 'run-1',
+    actor_id: 'actor-1',
+    metadata_json: '{"label":"ready"}',
     content: 'ready',
     content_hash: await contentHash('ready'),
     created_at: 1,
@@ -1505,6 +1665,7 @@ test('verifyMemoryState succeeds when hashes, exact groups, vectors, and scope m
           scope_key: await scopeKey(row),
           content_hash: row.content_hash,
           memory_vector_schema: '1',
+          vector_state_hash: await vectorStateHash(row),
         } }]
         : [];
     },
@@ -1519,6 +1680,30 @@ test('verifyMemoryState succeeds when hashes, exact groups, vectors, and scope m
   assert.equal(result.report.wrong_scope_key_count, 0);
   assert.equal(result.report.wrong_content_hash_count, 0);
   assert.equal(result.report.wrong_vector_schema_count, 0);
+  assert.equal(result.report.wrong_vector_state_hash_count, 0);
   assert.equal(result.report.unexpected_deleted_vector_count, 0);
   assert.deepEqual(result.report.unexpected_deleted_vector_ids, []);
+});
+
+test('verifyMemoryState rejects a stale full vector source hash and reports its memory ID', async () => {
+  const { vectorStateHash } = await import('../migrate-memory-deduplication.mjs');
+  const row = {
+    id: 'stale-metadata', user_id: 'u', agent_id: null, run_id: 'run-new', actor_id: 'actor-new',
+    metadata_json: '{"label":"new"}', content: 'unchanged', content_hash: await contentHash('unchanged'),
+    created_at: 1, deleted_at: null,
+  };
+  const staleSource = { ...row, run_id: 'run-old', actor_id: 'actor-old', metadata_json: '{"label":"old"}' };
+  const result = await verifyMemoryState({
+    rows: [row],
+    getVectors: async () => [{ id: row.id, metadata: {
+      scope_key: await scopeKey(row),
+      content_hash: row.content_hash,
+      memory_vector_schema: '1',
+      vector_state_hash: await vectorStateHash(staleSource),
+    } }],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.report.wrong_vector_state_hash_count, 1);
+  assert.deepEqual(result.report.wrong_vector_state_hash_ids, ['stale-metadata']);
 });

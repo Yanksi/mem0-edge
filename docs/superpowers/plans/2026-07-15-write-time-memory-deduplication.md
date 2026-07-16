@@ -896,14 +896,18 @@ committed prior apply remains safely resumable.
 
 Apply uses only the artifact's plan, deletes stale vectors, batch-reads active
 vectors, and calls Dashboard reindex only for vectors whose `content_hash`,
-`memory_vector_schema`, or `scope_key` metadata does not match D1. Delete and
+`memory_vector_schema`, `scope_key`, or `vector_state_hash` metadata does not
+match D1. `vector_state_hash` is SHA-256 over the exact JSON tuple `[user_id,
+agent_id, run_id, actor_id, metadata_json, content_hash]`; artifact rows include
+all six source fields and apply state validation rejects drift in any of them.
+Delete and
 Dashboard-upsert mutation IDs are captured. With writers paused, apply polls the
 Vectorize index-info endpoint until `processedUpToMutation` equals the last
 submitted maintenance mutation, including all-deleted runs whose last mutation
 is a delete. It cannot report success before this bounded barrier. `verify` uses
 D1 plus Vectorize `get_by_ids` batches and exits nonzero unless hashes, duplicate
-groups, vector presence, `content_hash`, `memory_vector_schema`, and `scope_key`
-are all converged.
+groups, vector presence, `content_hash`, `memory_vector_schema`, `scope_key`, and
+`vector_state_hash` are all converged.
 
 Add:
 
@@ -1092,10 +1096,12 @@ npm run maintenance:dedup -- verify
 ```
 
 Expected: apply validates the exact reviewed inspection artifact, completes all
-resumable phases, waits for its final Vectorize mutation, and verify reports zero
-null/mismatched hashes, zero active exact duplicate groups, zero missing active
-vectors, and zero wrong/missing `content_hash`, `memory_vector_schema`, or
-`scope_key` metadata, and exits `0`. Do not create or apply `0008` if verification
+resumable phases, performs idempotent graph repair and graph convergence auditing
+for every planned mapping before Vectorize mutation, waits for its final Vectorize
+mutation, and verify reports zero null/mismatched hashes, zero active exact
+duplicate groups, zero missing active
+vectors, and zero wrong/missing `content_hash`, `memory_vector_schema`,
+`scope_key`, or `vector_state_hash` metadata, and exits `0`. Do not create or apply `0008` if verification
 fails.
 
 - [ ] **Step 4: Write the failing final-schema test**

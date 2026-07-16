@@ -23,7 +23,7 @@ import {
   setDashboardSettings,
 } from '../src/dashboard/service';
 import type { Env } from '../src/env';
-import { contentHash, scopeKey } from '../src/memory/identity';
+import { contentHash, scopeKey, vectorStateHash } from '../src/memory/identity';
 
 const env = workerEnv as unknown as Env;
 
@@ -67,21 +67,23 @@ async function seedMemory({
 describe('dashboard memory reindexing', () => {
   it('uses shared vector metadata including the D1 content hash and returns the mutation ID', async () => {
     const testEnv = { DB: env.DB, VECTORIZE: {} as VectorizeIndex } as Env;
+    const metadata = {
+      label: 'important',
+      score: 0.75,
+      ignoredNull: null,
+      ignoredObject: { nested: true },
+      user_id: 'spoofed-user',
+      scope_key: 'spoofed-scope',
+    };
+    const content = 'Remember the paired scope.';
     await seedMemory({
       id: 'paired-memory',
       userId: 'user-1',
       agentId: 'agent-1',
       runId: 'run-1',
       actorId: 'actor-1',
-      content: 'Remember the paired scope.',
-      metadata: {
-        label: 'important',
-        score: 0.75,
-        ignoredNull: null,
-        ignoredObject: { nested: true },
-        user_id: 'spoofed-user',
-        scope_key: 'spoofed-scope',
-      },
+      content,
+      metadata,
       createdAt: 1,
     });
     dependencies.embedText.mockResolvedValue([0.25, 0.75]);
@@ -106,6 +108,10 @@ describe('dashboard memory reindexing', () => {
         scope_key: await scopeKey({ userId: 'user-1', agentId: 'agent-1' }),
         content_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
         memory_vector_schema: '1',
+        vector_state_hash: await vectorStateHash({
+          userId: 'user-1', agentId: 'agent-1', runId: 'run-1', actorId: 'actor-1',
+          metadataJson: JSON.stringify(metadata), contentHash: await contentHash(content),
+        }),
       },
     }]);
   });

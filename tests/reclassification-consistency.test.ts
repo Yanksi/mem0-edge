@@ -17,7 +17,7 @@ vi.mock('../src/vectorize', () => ({
 }));
 
 import { processMem0AgentReclassificationJob } from '../src/import/service';
-import { contentHash, scopeKey } from '../src/memory/identity';
+import { contentHash, scopeKey, vectorStateHash } from '../src/memory/identity';
 
 const db = (workerEnv as unknown as Env).DB;
 const vectorIndex = {} as VectorizeIndex;
@@ -254,6 +254,10 @@ describe('agent reclassification consistency', () => {
         scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
         content_hash: await contentHash(content),
         memory_vector_schema: '1',
+        vector_state_hash: await vectorStateHash({
+          userId: null, agentId: 'agent-1', runId: 'run-1', actorId: 'actor-1',
+          metadataJson, contentHash: digest,
+        }),
       },
     }]);
     expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'target-memory');
@@ -302,6 +306,11 @@ describe('agent reclassification consistency', () => {
         scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
         content_hash: digest,
         memory_vector_schema: '1',
+        vector_state_hash: await vectorStateHash({
+          userId: null, agentId: 'agent-1', runId: 'run-1', actorId: 'actor-1',
+          metadataJson: JSON.stringify({ label: 'paired', user_id: 'spoofed', agent_id: 'spoofed' }),
+          contentHash: digest,
+        }),
       },
     }]);
     expect(dependencies.deleteVector).not.toHaveBeenCalled();

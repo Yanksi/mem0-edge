@@ -10,6 +10,7 @@ const RESERVED_VECTOR_METADATA_KEYS = new Set([
   'scope_key',
   'content_hash',
   'memory_vector_schema',
+  'vector_state_hash',
 ]);
 
 export const MEMORY_VECTOR_SCHEMA_VERSION = '1';
@@ -34,6 +35,17 @@ export function scopeKey(scope: MemoryOwnerScope): Promise<string> {
   return sha256Hex(JSON.stringify([scope.userId, scope.agentId]));
 }
 
+export function vectorStateHash(row: MemoryVectorSource): Promise<string> {
+  return sha256Hex(JSON.stringify([
+    row.userId,
+    row.agentId,
+    row.runId,
+    row.actorId,
+    row.metadataJson,
+    row.contentHash,
+  ]));
+}
+
 export function ownerPredicate(scope: MemoryOwnerScope): SQL {
   return and(
     scope.userId === null ? isNull(memories.userId) : eq(memories.userId, scope.userId),
@@ -53,6 +65,7 @@ export async function memoryVectorMetadata(
     scope_key: await scopeKey(row),
     content_hash: row.contentHash,
     memory_vector_schema: MEMORY_VECTOR_SCHEMA_VERSION,
+    vector_state_hash: await vectorStateHash(row),
   };
 }
 

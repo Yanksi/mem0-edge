@@ -17,7 +17,18 @@ const VECTOR_BATCH_SIZE = 100;
 const VECTOR_MUTATION_TIMEOUT_MS = 2 * 60 * 1_000;
 const VECTOR_MUTATION_POLL_INTERVAL_MS = 1_000;
 const MEMORY_VECTOR_SCHEMA_VERSION = '1';
-const INSPECTION_ARTIFACT_SCHEMA = 'memory-deduplication-inspection/v1';
+const INSPECTION_ARTIFACT_SCHEMA = 'memory-deduplication-inspection/v2';
+
+export function vectorStateHash(row) {
+  return sha256Hex(JSON.stringify([
+    row.user_id,
+    row.agent_id,
+    row.run_id,
+    row.actor_id,
+    row.metadata_json,
+    row.content_hash,
+  ]));
+}
 
 export const USAGE = `Usage:
   node --env-file=.env scripts/migrate-memory-deduplication.mjs inspect
@@ -289,7 +300,8 @@ export async function pageAllMemories(queryD1, pageSize = MEMORY_PAGE_SIZE) {
     const body = cursor === undefined
       ? {
           sql: `
-            SELECT id, user_id, agent_id, content, content_hash, created_at, deleted_at
+            SELECT id, user_id, agent_id, run_id, actor_id, metadata_json,
+              content, content_hash, created_at, deleted_at
             FROM memories
             ORDER BY created_at ASC, id ASC
             LIMIT ?
@@ -298,7 +310,8 @@ export async function pageAllMemories(queryD1, pageSize = MEMORY_PAGE_SIZE) {
         }
       : {
           sql: `
-            SELECT id, user_id, agent_id, content, content_hash, created_at, deleted_at
+            SELECT id, user_id, agent_id, run_id, actor_id, metadata_json,
+              content, content_hash, created_at, deleted_at
             FROM memories
             WHERE created_at > ? OR (created_at = ? AND id > ?)
             ORDER BY created_at ASC, id ASC
@@ -361,7 +374,7 @@ export async function applyHashUpdates({
   return { attempted: updates.length, batches: batches.length };
 }
 
-const ACTIVE_EXACT_PAIR_GUARD = `
+const EXACT_PAIR_GUARD = `
   EXISTS (
     SELECT 1
     FROM memories AS canonical
@@ -373,7 +386,6 @@ const ACTIVE_EXACT_PAIR_GUARD = `
     WHERE canonical.id = ?
       AND loser.id = ?
       AND canonical.deleted_at IS NULL
-      AND loser.deleted_at IS NULL
   )
 `;
 
@@ -387,7 +399,7 @@ export async function cleanupDuplicate({ mapping, queryD1 }) {
           SELECT ?, links.entity_id, links.created_at
           FROM memory_entity_links AS links
           WHERE links.memory_id = ?
-            AND ${ACTIVE_EXACT_PAIR_GUARD}
+            AND ${EXACT_PAIR_GUARD}
         `,
         params: [canonicalId, loserId, canonicalId, loserId],
       },
@@ -396,7 +408,7 @@ export async function cleanupDuplicate({ mapping, queryD1 }) {
           UPDATE relationships
           SET evidence_memory_id = ?
           WHERE evidence_memory_id = ?
-            AND ${ACTIVE_EXACT_PAIR_GUARD}
+            AND ${EXACT_PAIR_GUARD}
         `,
         params: [canonicalId, loserId, canonicalId, loserId],
       },
@@ -424,6 +436,59 @@ export async function cleanupDuplicate({ mapping, queryD1 }) {
   });
   const deletedRows = results[2]?.results;
   return Array.isArray(deletedRows) && deletedRows.some((row) => row?.id === loserId);
+}
+
+export async function verifyGraphConvergence({
+  mappings,
+  queryD1,
+  batchSize = D1_BATCH_SIZE,
+}) {
+  const incomplete = [];
+  for (const batch of chunks(mappings, batchSize)) {
+    const results = await queryD1({
+      batch: batch.map(({ canonicalId, loserId }) => ({
+        sql: `
+          SELECT ? AS canonical_id, ? AS loser_id,
+            (SELECT COUNT(*) FROM relationships
+              WHERE evidence_memory_id = ?) AS relationship_evidence_count,
+            (SELECT COUNT(*)
+              FROM memory_entity_links AS loser_link
+              WHERE loser_link.memory_id = ?
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM memory_entity_links AS canonical_link
+                  WHERE canonical_link.memory_id = ?
+                    AND canonical_link.entity_id = loser_link.entity_id
+                )) AS missing_canonical_link_count
+        `,
+        params: [canonicalId, loserId, loserId, loserId, canonicalId],
+      })),
+    });
+    if (!Array.isArray(results) || results.length !== batch.length) {
+      throw new Error('graph convergence audit returned invalid D1 results');
+    }
+    for (let index = 0; index < batch.length; index += 1) {
+      const mapping = batch[index];
+      const rows = results[index]?.results;
+      const row = Array.isArray(rows) && rows.length === 1 ? rows[0] : undefined;
+      const relationshipEvidenceCount = Number(row?.relationship_evidence_count);
+      const missingCanonicalLinkCount = Number(row?.missing_canonical_link_count);
+      if (row?.canonical_id !== mapping.canonicalId
+        || row?.loser_id !== mapping.loserId
+        || !Number.isInteger(relationshipEvidenceCount) || relationshipEvidenceCount < 0
+        || !Number.isInteger(missingCanonicalLinkCount) || missingCanonicalLinkCount < 0) {
+        throw new Error(`graph convergence audit returned invalid state for planned loser ${mapping.loserId}`);
+      }
+      if (relationshipEvidenceCount > 0 || missingCanonicalLinkCount > 0) {
+        incomplete.push({
+          ...mapping,
+          relationshipEvidenceCount,
+          missingCanonicalLinkCount,
+        });
+      }
+    }
+  }
+  return { ok: incomplete.length === 0, incomplete };
 }
 
 export async function deleteVectorIds({
@@ -579,7 +644,8 @@ async function vectorMapForRows({ rows, getVectors, vectorBatchSize }) {
 async function vectorMatchesRow(vector, row) {
   return vector?.metadata?.scope_key === await scopeKey(row)
     && vector.metadata.content_hash === row.content_hash
-    && vector.metadata.memory_vector_schema === MEMORY_VECTOR_SCHEMA_VERSION;
+    && vector.metadata.memory_vector_schema === MEMORY_VECTOR_SCHEMA_VERSION
+    && vector.metadata.vector_state_hash === await vectorStateHash(row);
 }
 
 export async function pendingReindexRows({
@@ -622,6 +688,7 @@ export async function verifyMemoryState({
   const wrongScopeKeyIds = [];
   const wrongContentHashIds = [];
   const wrongVectorSchemaIds = [];
+  const wrongVectorStateHashIds = [];
   for (const row of activeRows) {
     const vector = vectorsById.get(row.id);
     if (vector === undefined) {
@@ -631,6 +698,7 @@ export async function verifyMemoryState({
     if (vector.metadata?.scope_key !== await scopeKey(row)) wrongScopeKeyIds.push(row.id);
     if (vector.metadata?.content_hash !== row.content_hash) wrongContentHashIds.push(row.id);
     if (vector.metadata?.memory_vector_schema !== MEMORY_VECTOR_SCHEMA_VERSION) wrongVectorSchemaIds.push(row.id);
+    if (vector.metadata?.vector_state_hash !== await vectorStateHash(row)) wrongVectorStateHashIds.push(row.id);
   }
   const returnedDeletedIds = new Set(deletedVectors.map((vector) => vector.id));
   const unexpectedDeletedVectorIds = deletedRows
@@ -654,6 +722,8 @@ export async function verifyMemoryState({
     wrong_content_hash_ids: wrongContentHashIds,
     wrong_vector_schema_count: wrongVectorSchemaIds.length,
     wrong_vector_schema_ids: wrongVectorSchemaIds,
+    wrong_vector_state_hash_count: wrongVectorStateHashIds.length,
+    wrong_vector_state_hash_ids: wrongVectorStateHashIds,
     unexpected_deleted_vector_count: unexpectedDeletedVectorIds.length,
     unexpected_deleted_vector_ids: unexpectedDeletedVectorIds,
     operator_note: 'Vectorize mutations are asynchronous; deleted vectors may remain visible briefly. If verification follows apply immediately and fails, wait briefly and rerun verify.',
@@ -665,6 +735,7 @@ export async function verifyMemoryState({
       && report.wrong_scope_key_count === 0
       && report.wrong_content_hash_count === 0
       && report.wrong_vector_schema_count === 0
+      && report.wrong_vector_state_hash_count === 0
       && report.unexpected_deleted_vector_count === 0,
     report,
   };
@@ -723,6 +794,7 @@ function artifactPayload(artifact) {
 }
 
 export async function createInspectionArtifact({ rows, config, createdAt }) {
+  validateArtifactRows(rows);
   const report = await inspectionPlan(rows);
   const payload = {
     artifact_schema: INSPECTION_ARTIFACT_SCHEMA,
@@ -753,6 +825,9 @@ function validateArtifactRows(rows) {
       && typeof row.id === 'string' && row.id !== ''
       && (row.user_id === null || typeof row.user_id === 'string')
       && (row.agent_id === null || typeof row.agent_id === 'string')
+      && (row.run_id === null || typeof row.run_id === 'string')
+      && (row.actor_id === null || typeof row.actor_id === 'string')
+      && typeof row.metadata_json === 'string'
       && typeof row.content === 'string'
       && (row.content_hash === null || typeof row.content_hash === 'string')
       && Number.isFinite(Number(row.created_at))
@@ -812,7 +887,9 @@ export async function validateApplyState(artifact, currentRows) {
   const loserIds = new Set(artifact.mappings.map(({ loserId }) => loserId));
   for (const inspected of artifact.rows) {
     const current = currentById.get(inspected.id);
-    for (const field of ['user_id', 'agent_id', 'content', 'created_at']) {
+    for (const field of [
+      'user_id', 'agent_id', 'run_id', 'actor_id', 'metadata_json', 'content', 'created_at',
+    ]) {
       if (current[field] !== inspected[field]) {
         throw new Error(`inspection artifact state memory ${inspected.id} changed ${field}`);
       }
@@ -980,6 +1057,13 @@ export async function runCommand(parsed, {
   if (remainingMappings.length > 0) {
     throw new Error(`duplicate cleanup is incomplete for ${remainingMappings.length} rows; rerun apply --confirm`);
   }
+  const graphConvergence = await verifyGraphConvergence({ mappings, queryD1 });
+  if (!graphConvergence.ok) {
+    const staleIds = graphConvergence.incomplete.map(({ loserId }) => loserId);
+    throw new Error(
+      `graph convergence is incomplete for ${staleIds.length} planned loser(s): ${staleIds.join(', ')}`,
+    );
+  }
 
   const deletedVectorIds = finalRows
     .filter((row) => row.deleted_at !== null)
@@ -1008,6 +1092,7 @@ export async function runCommand(parsed, {
     hash_update_batches: hashResult.batches,
     duplicate_mappings_planned: mappings.length,
     duplicates_decisively_merged: decisiveLoserIds.length,
+    graph_mappings_verified: mappings.length,
     deleted_vector_ids_submitted: vectorDeleteResult.ids,
     vector_delete_batches: vectorDeleteResult.batches,
     active_memories_already_converged: activeRows.length - pendingReindex.length,

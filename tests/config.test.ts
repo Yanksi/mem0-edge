@@ -203,7 +203,9 @@ describe('semantic deduplication documentation', () => {
     expect(readme).toContain('artifact schema, exact target configuration, inspected rows, planned mappings, and SHA-256 integrity fingerprint');
     expect(readme).toContain('Apply rejects target drift, artifact corruption, and any D1 state not reachable from the inspected rows through this artifact');
     expect(readme).toContain('waits until `processedUpToMutation` equals the last submitted maintenance mutation');
-    expect(readme).toContain('`content_hash`, `memory_vector_schema`, and `scope_key`');
+    expect(readme).toContain('`vector_state_hash`');
+    expect(readme).toContain('[user ID, agent ID, run ID, actor ID, raw metadata JSON, content hash]');
+    expect(readme).toContain('repairs and audits every reviewed duplicate mapping before any Vectorize mutation');
   });
 
   it('runs maintenance tests from the normal npm test lifecycle while preserving focused Vitest arguments', () => {
@@ -267,6 +269,8 @@ describe('semantic deduplication documentation', () => {
     expect(implementationPlan).toContain('npm run maintenance:dedup -- apply --confirm backups/memory-deduplication-<timestamp>.json');
     expect(implementationPlan).toContain('processedUpToMutation');
     expect(implementationPlan).toContain('memory_vector_schema');
+    expect(implementationPlan).toContain('vector_state_hash');
+    expect(implementationPlan).toContain('graph convergence');
     expect(implementationPlan).toContain('artifact schema');
   });
 

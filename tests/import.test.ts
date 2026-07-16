@@ -28,7 +28,7 @@ import {
   processMem0ImportJob,
   RawMemoryMigrationExport,
 } from '../src/import/service';
-import { contentHash, scopeKey } from '../src/memory/identity';
+import { contentHash, scopeKey, vectorStateHash } from '../src/memory/identity';
 
 const env = {
   MEMORY_JOBS: { send: vi.fn(), sendBatch: vi.fn() },
@@ -987,6 +987,10 @@ describe('Mem0 agent reclassification', () => {
         scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
         content_hash: digest,
         memory_vector_schema: '1',
+        vector_state_hash: await vectorStateHash({
+          userId: null, agentId: 'agent-1', runId: 'run-1', actorId: 'actor-1',
+          metadataJson: job.metadataJson, contentHash: digest,
+        }),
       },
     }]);
     expect(dependencies.deleteVector).not.toHaveBeenCalled();
