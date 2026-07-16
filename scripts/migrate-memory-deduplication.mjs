@@ -509,9 +509,7 @@ export async function verifyMemoryState({
 }) {
   const hashUpdates = await pendingHashUpdates(rows);
   const updateIds = new Set(hashUpdates.map(({ id }) => id));
-  const nullHashIds = rows
-    .filter((row) => row.content_hash === null && updateIds.has(row.id))
-    .map((row) => row.id);
+  const nullHashIds = rows.filter((row) => row.content_hash === null).map((row) => row.id);
   const mismatchedHashIds = rows
     .filter((row) => row.content_hash !== null && updateIds.has(row.id))
     .map((row) => row.id);

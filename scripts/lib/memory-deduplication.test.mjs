@@ -128,7 +128,7 @@ test('duplicateMappings uses exact ascending ID order instead of locale collatio
   ]);
 });
 
-test('pendingHashUpdates hashes exact active content and is idempotent on rerun', async () => {
+test('pendingHashUpdates hashes exact content for active and deleted rows and is idempotent', async () => {
   const rows = [
     { id: 'raw', content: ' Keep CASE and space ', content_hash: null, deleted_at: null },
     { id: 'deleted', content: 'Deleted content', content_hash: 'wrong', deleted_at: 100 },
@@ -143,14 +143,56 @@ test('pendingHashUpdates hashes exact active content and is idempotent on rerun'
   const updates = await pendingHashUpdates(rows);
   assert.deepEqual(updates, [
     { id: 'raw', contentHash: await contentHash(' Keep CASE and space ') },
+    { id: 'deleted', contentHash: await contentHash('Deleted content') },
   ]);
 
   const updatedRows = rows.map((row) => {
     const update = updates.find(({ id }) => id === row.id);
     return update === undefined ? row : { ...row, content_hash: update.contentHash };
   });
-  assert.equal(updatedRows[1].content_hash, 'wrong');
   assert.deepEqual(await pendingHashUpdates(updatedRows), []);
+});
+
+test('a deleted null hash is backfilled before verify can succeed', async () => {
+  const row = {
+    id: 'deleted-null-hash',
+    user_id: 'retired-user',
+    agent_id: null,
+    content: 'retired content',
+    content_hash: null,
+    created_at: 1,
+    deleted_at: 50,
+  };
+  const getVectors = async () => [];
+  const before = await verifyMemoryState({ rows: [row], getVectors });
+  assert.equal(before.ok, false);
+  assert.equal(before.report.hash_issue_count, 1);
+  assert.deepEqual(before.report.null_hash_ids, ['deleted-null-hash']);
+
+  const updates = await pendingHashUpdates([row]);
+  assert.deepEqual(updates, [{
+    id: 'deleted-null-hash',
+    contentHash: await contentHash(row.content),
+  }]);
+  await applyHashUpdates({
+    rows: [row],
+    updates,
+    queryD1: async (body) => {
+      assert.deepEqual(body.batch[0].params, [
+        updates[0].contentHash,
+        row.id,
+        row.content,
+        updates[0].contentHash,
+      ]);
+      row.content_hash = body.batch[0].params[0];
+      return successfulD1Result([], 1);
+    },
+  });
+
+  const after = await verifyMemoryState({ rows: [row], getVectors });
+  assert.equal(after.ok, true);
+  assert.equal(after.report.hash_issue_count, 0);
+  assert.deepEqual(after.report.null_hash_ids, []);
 });
 
 function jsonResponse(body, status = 200, headers = {}) {
@@ -198,7 +240,7 @@ async function createStatefulMaintenanceFake(failurePhase) {
       user_id: 'retired-user',
       agent_id: null,
       content: 'retired',
-      content_hash: null,
+      content_hash: await contentHash('retired'),
       created_at: 4,
       deleted_at: 50,
     },
@@ -829,7 +871,7 @@ test('confirmed apply resumes after every committed phase and converges idempote
       assert.equal(canonical.content_hash, await contentHash(canonical.content));
       assert.equal(loser.content_hash, await contentHash(loser.content));
       assert.equal(other.content_hash, await contentHash(other.content));
-      assert.equal(unrelatedDeleted.content_hash, null);
+      assert.equal(unrelatedDeleted.content_hash, await contentHash(unrelatedDeleted.content));
       assert.equal(unrelatedDeleted.deleted_at, 50);
       assert.equal(loser.deleted_at, 100);
       assert.deepEqual([...fake.vectors.keys()].sort(), ['canonical', 'other']);
@@ -1136,7 +1178,7 @@ test('verifyMemoryState batches active and deleted vector reads and reports ever
 
   assert.equal(result.ok, false);
   assert.deepEqual(calls, [['canonical', 'duplicate'], ['missing', 'wrong-scope'], ['deleted-null']]);
-  assert.deepEqual(result.report.null_hash_ids, ['missing']);
+  assert.deepEqual(result.report.null_hash_ids, ['missing', 'deleted-null']);
   assert.deepEqual(result.report.mismatched_hash_ids, []);
   assert.deepEqual(result.report.active_duplicate_mappings, [
     { canonicalId: 'canonical', loserId: 'duplicate' },
