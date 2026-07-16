@@ -968,7 +968,7 @@ DASHBOARD_PASSWORD=
 
 README must clearly state:
 
-- exact write-time deduplication is always enabled and keyed by the full user/agent scope;
+- phase-one exact matching runs on every write but remains race-prone until production-verified migration `0008` adds database uniqueness;
 - semantic deduplication defaults off and is enabled in Dashboard System settings;
 - only new writes are checked semantically; existing data is not semantically consolidated;
 - contradictions, temporal updates, and material additions remain distinct;
@@ -1025,7 +1025,7 @@ Expected: `False`. Do not proceed if it is `True`.
 - [ ] **Step 3: Apply migration `0007` and create the metadata index**
 
 ```powershell
-npx.cmd wrangler d1 migrations apply mem0-edge --remote
+npx.cmd wrangler d1 migrations apply DB --remote
 npx.cmd wrangler vectorize create-metadata-index mem0-edge --property-name=scope_key --type=string
 npx.cmd wrangler vectorize list-metadata-index mem0-edge
 ```
@@ -1040,7 +1040,17 @@ npm run deploy
 
 Expected: deployment succeeds on `mem0.yanksi.li`. Confirm `GET /dashboard/api/settings` reports `false` through a signed Dashboard session.
 
-- [ ] **Step 5: Commit any checked deployment metadata only if Wrangler changed tracked files**
+- [ ] **Step 5: Pause every write ingress and drain Queue work**
+
+Pause every source that can directly mutate memories or enqueue memory work,
+including Hermes and direct API mutations, Dashboard imports and
+reclassification, scheduled dispatchers, retry publishers, and other Queue
+producers. Leave consumers running only long enough to drain active deliveries,
+retries, delayed messages, and backlog to zero, then confirm no producer can
+refill the Queue. Keep semantic deduplication off. Do not start Task 12 or run
+`inspect` until this pause-and-drain boundary is confirmed.
+
+- [ ] **Step 6: Commit any checked deployment metadata only if Wrangler changed tracked files**
 
 Do not commit `.env`, `.dev.vars`, migration exports, backup reports, or the three user JSON exports. If no tracked file changed, skip this commit.
 
@@ -1051,9 +1061,12 @@ Do not commit `.env`, `.dev.vars`, migration exports, backup reports, or the thr
 - Modify after successful verification: `src/db/schema.ts`
 - Modify: `tests/schema.test.ts`
 
-- [ ] **Step 1: Pause writers and drain Queue work**
+- [ ] **Step 1: Confirm writers remain paused and Queue work remains drained**
 
-Pause Hermes memory writes. Inspect Cloudflare Queue metrics until the active backlog and retries are both zero. Keep the Dashboard semantic toggle off.
+Reconfirm every Task 11 ingress remains paused and Queue metrics show zero
+active deliveries, retries, delayed messages, and backlog. Keep the Dashboard
+semantic toggle off. If any writer resumed or any producer refilled the Queue,
+return to Task 11 Step 5 and drain again before inspection.
 
 - [ ] **Step 2: Inspect production without mutation**
 
@@ -1228,16 +1241,18 @@ git diff --check
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit and apply final enforcement**
+- [ ] **Step 8: Commit and apply final enforcement while writers remain paused**
 
 ```powershell
 git add src/migrations/0008_memory_deduplication_enforce.sql src/db/schema.ts tests/schema.test.ts
 git commit -m "feat: enforce exact memory uniqueness"
-npx.cmd wrangler d1 migrations apply mem0-edge --remote
+npx.cmd wrangler d1 migrations apply DB --remote
 npm run deploy
 ```
 
 Expected: only migration `0008` is newly applied and deployment succeeds.
+Every writer must remain paused until this step and its post-migration checks
+complete.
 
 - [ ] **Step 9: Run production probes while writes remain paused**
 
@@ -1251,9 +1266,12 @@ Verify all three owner scopes, exact duplicate return, soft-delete recreation, s
 
 Delete probe records and disable the toggle if any semantic probe fails.
 
-- [ ] **Step 10: Resume writers and commit final test/document adjustments**
+- [ ] **Step 10: Resume writers only after migration `0008`**
 
-Resume Hermes only after exact and semantic probes pass or after semantic deduplication is deliberately left off. Re-run `npm test` and commit only intentional tracked adjustments.
+Resume write ingress only after migration `0008` has been reviewed, applied, and
+the exact probes pass. Semantic deduplication may remain deliberately off; if it
+is enabled, its probes must also pass before normal traffic resumes. Re-run
+`npm test` and commit only intentional tracked adjustments.
 
 ## Task 13: Final Review and Publication
 

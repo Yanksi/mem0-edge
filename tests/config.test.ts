@@ -3,11 +3,16 @@ import { describe, expect, it } from 'vitest';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import devVarsExample from '../.dev.vars.example?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
+import implementationPlan from '../docs/superpowers/plans/2026-07-15-write-time-memory-deduplication.md?raw';
+// @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import readme from '../README.md?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import wranglerConfig from '../wrangler.toml?raw';
 // @ts-expect-error Raw asset module declarations are intentionally absent from tsconfig.
 import remotePreviewConfig from '../wrangler.remote-preview.toml?raw';
+
+// @ts-expect-error Vite supplies import.meta.glob at test runtime.
+const migrationFiles = Object.keys(import.meta.glob('../src/migrations/*.sql'));
 
 const dedupDefaults = {
   DEDUP_LLM_API_BASE_URL: 'https://openrouter.ai/api/v1',
@@ -86,10 +91,13 @@ describe('local secret template', () => {
 });
 
 describe('semantic deduplication documentation', () => {
-  it('describes the guided deployment flow without promising resource provisioning', () => {
+  it('describes automatic supported-resource provisioning and manual operator duties', () => {
     expect(readme).toContain("The Deploy button opens Cloudflare's guided deployment and fork flow.");
-    expect(readme).toContain('Operators must still create or select the required D1, Vectorize, Queue, and DLQ resources');
-    expect(readme).not.toContain("Cloudflare's deploy button provisions the declared D1, Vectorize, and Queue bindings");
+    expect(readme).toContain('Cloudflare can automatically provision supported D1, Vectorize, Queue, and DLQ resources.');
+    expect(readme).toContain('Operators must verify every resulting binding targets the intended resource.');
+    expect(readme).toContain('The manual commands below are an alternative');
+    expect(readme).toContain('D1 migrations, Vectorize metadata indexes, and secrets remain manual.');
+    expect(readme).not.toContain('Operators must still create or select the required D1, Vectorize, Queue, and DLQ resources');
   });
 
   it('describes the checked-in D1 binding without treating it as a placeholder', () => {
@@ -107,7 +115,8 @@ describe('semantic deduplication documentation', () => {
 
   it('keeps repository and write-time behavior accurate', () => {
     expect(readme).toContain('https://github.com/Yanksi/mem-worker');
-    expect(readme).toContain('Exact write-time deduplication is always enabled.');
+    expect(readme).toContain('Phase-one exact matching runs on every write, but it is race-prone before migration `0008`');
+    expect(readme).toContain('Concurrency-safe exact uniqueness begins only after production verification succeeds and the reviewed migration `0008` is created and applied.');
     expect(readme).toContain('full (`user_id`, `agent_id`) scope, including every null/value combination');
     expect(readme).toContain('raw memory text after the hash lookup, guarding against hash collisions');
     expect(readme).toContain('Semantic write-time deduplication defaults to **off**.');
@@ -157,6 +166,25 @@ describe('semantic deduplication documentation', () => {
     expect(readme).toContain('Vectorize dimensions are immutable; changing dimensions requires recreating the indexes.');
   });
 
+  it('uses the D1 binding name for migration commands', () => {
+    expect(readme).toContain('npx wrangler d1 migrations apply DB --remote');
+    expect(implementationPlan).toContain('npx.cmd wrangler d1 migrations apply DB --remote');
+    expect(readme).not.toContain('npx wrangler d1 migrations apply mem0-edge --remote');
+    expect(implementationPlan).not.toContain('npx.cmd wrangler d1 migrations apply mem0-edge --remote');
+  });
+
+  it('documents Hermes base URL and identity ownership', () => {
+    expect(readme).toContain('"host": "https://your-worker.example/v1"');
+    expect(readme).toContain('MEM0_HOST=https://your-worker.example.workers.dev/v1');
+    expect(readme).toContain('`user_id` is supplied by the caller');
+    expect(readme).toContain('`agent_id` further partitions search and deduplication scope');
+  });
+
+  it('documents Windows command shims', () => {
+    expect(readme).toContain('use `npm.cmd` and `npx.cmd`');
+    expect(readme).toContain('PowerShell execution policy blocks the `npm.ps1` or `npx.ps1` shims');
+  });
+
   it('documents the maintenance commands and security boundary', () => {
     for (const command of [
       'npm run maintenance:dedup -- inspect',
@@ -171,20 +199,61 @@ describe('semantic deduplication documentation', () => {
     expect(readme).toContain('Inspection backups contain memory contents and must be protected as sensitive data');
   });
 
-  it('requires production verification between migration phases', () => {
-    const deploy0007 = readme.indexOf('Deploy the application code and apply migration `0007_memory_deduplication_prepare.sql` only.');
+  it('keeps every write ingress paused from maintenance through migration 0008', () => {
+    const apply0007 = readme.indexOf('Apply migration `0007_memory_deduplication_prepare.sql` only');
+    const scopeKey = readme.indexOf('then create and verify the string `scope_key` Vectorize metadata index');
+    const deploy = readme.indexOf('Deploy phase-one code with semantic deduplication still off.');
+    const pause = readme.indexOf('Pause every write ingress');
+    const drain = readme.indexOf('Drain the Queue completely, including active deliveries, retries, delayed messages, and backlog');
     const inspect = readme.indexOf('Run `inspect` and review its report and backup.');
-    const pause = readme.indexOf('Pause writers and drain the queue according to your operator workflow.');
     const apply = readme.indexOf('Run `apply --confirm`.');
     const verify = readme.indexOf('Run `verify` and confirm that it succeeds in production.');
     const create0008 = readme.indexOf('Only after successful production verification, create and apply migration `0008`');
+    const resume = readme.indexOf('Resume writers only after migration `0008` has been applied');
 
-    expect([deploy0007, inspect, pause, apply, verify, create0008].every((index) => index >= 0)).toBe(true);
-    expect(deploy0007).toBeLessThan(inspect);
-    expect(inspect).toBeLessThan(pause);
-    expect(pause).toBeLessThan(apply);
+    expect([
+      apply0007, scopeKey, deploy, pause, drain, inspect, apply, verify, create0008, resume,
+    ].every((index) => index >= 0)).toBe(true);
+    expect(apply0007).toBeLessThan(scopeKey);
+    expect(scopeKey).toBeLessThan(deploy);
+    expect(deploy).toBeLessThan(pause);
+    expect(pause).toBeLessThan(drain);
+    expect(drain).toBeLessThan(inspect);
+    expect(inspect).toBeLessThan(apply);
     expect(apply).toBeLessThan(verify);
     expect(verify).toBeLessThan(create0008);
+    expect(create0008).toBeLessThan(resume);
+  });
+
+  it('keeps the implementation plan pause boundary aligned with the rollout', () => {
+    const rollout = implementationPlan.slice(implementationPlan.indexOf('## Task 11:'));
+    const apply0007 = rollout.indexOf('**Step 3: Apply migration `0007` and create the metadata index**');
+    const deploy = rollout.indexOf('**Step 4: Deploy phase-one code with semantic deduplication off**');
+    const pause = rollout.indexOf('**Step 5: Pause every write ingress and drain Queue work**');
+    const task12 = rollout.indexOf('## Task 12:');
+    const confirmPaused = rollout.indexOf('**Step 1: Confirm writers remain paused and Queue work remains drained**');
+    const inspect = rollout.indexOf('**Step 2: Inspect production without mutation**');
+    const applyAndVerify = rollout.indexOf('**Step 3: Require explicit operator confirmation, then apply and verify**');
+    const enforce = rollout.indexOf('**Step 8: Commit and apply final enforcement while writers remain paused**');
+    const resume = rollout.indexOf('**Step 10: Resume writers only after migration `0008`**');
+
+    expect([
+      apply0007, deploy, pause, task12, confirmPaused, inspect, applyAndVerify, enforce, resume,
+    ].every((index) => index >= 0)).toBe(true);
+    expect(apply0007).toBeLessThan(deploy);
+    expect(deploy).toBeLessThan(pause);
+    expect(pause).toBeLessThan(task12);
+    expect(task12).toBeLessThan(confirmPaused);
+    expect(confirmPaused).toBeLessThan(inspect);
+    expect(inspect).toBeLessThan(applyAndVerify);
+    expect(applyAndVerify).toBeLessThan(enforce);
+    expect(enforce).toBeLessThan(resume);
+    expect(implementationPlan).toContain('phase-one exact matching runs on every write but remains race-prone until production-verified migration `0008` adds database uniqueness');
+  });
+
+  it('asserts migration 0008 is not in the phase-one inventory', () => {
+    expect(migrationFiles).toContain('../src/migrations/0007_memory_deduplication_prepare.sql');
+    expect(migrationFiles.filter((path) => /\/0008[^/]*\.sql$/.test(path))).toEqual([]);
   });
 
   it('does not describe the removed manual cleanup control or API', () => {

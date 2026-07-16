@@ -6,7 +6,7 @@ This is **not** the full Python Mem0 implementation. It deliberately uses D1 for
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Yanksi/mem-worker)
 
-Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deploy button opens Cloudflare's guided deployment and fork flow. Operators must still create or select the required D1, Vectorize, Queue, and DLQ resources, wire their bindings to the Worker, create the metadata indexes listed below, and set the required secrets.
+Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deploy button opens Cloudflare's guided deployment and fork flow. Cloudflare can automatically provision supported D1, Vectorize, Queue, and DLQ resources. Operators must verify every resulting binding targets the intended resource. The manual commands below are an alternative when the guided flow does not provision a required resource. D1 migrations, Vectorize metadata indexes, and secrets remain manual.
 
 ## Included
 
@@ -18,7 +18,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deplo
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and bounded Queue consumers for asynchronous ingestion and Mem0 imports.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
-- Exact write-time memory deduplication, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
+- Phase-one exact write-time matching, final database-enforced exact uniqueness, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
 - Dashboard views for semantic search, paginated active-memory browsing, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
@@ -28,7 +28,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deplo
 - Hosted Mem0 Platform features such as organizations, billing, advanced user management, and hosted-dashboard parity.
 - Alternative vector stores, graph databases, or the broad LLM/embedder provider matrix from Mem0 OSS.
 - A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
-- Automatic Cloudflare resource provisioning or secret creation. Deployment requires creating the D1 database, Vectorize indexes, Queue and DLQ, metadata indexes, and secrets described below.
+- Zero-touch Cloudflare setup without operator verification. The guided flow can provision supported resources, but operators must verify bindings and manually apply migrations, create metadata indexes, and set secrets.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
 - Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view; the dashboard can create, change, or remove display aliases for stored user IDs.
 - Automatic semantic consolidation of existing memories or a general bulk cleanup UI. Semantic meaning deduplication is opt-in and applies only to new writes.
@@ -63,7 +63,7 @@ These four model paths are configured independently. Every key is a secret, and 
 
 ### Memory deduplication
 
-Exact write-time deduplication is always enabled. It uses the full (`user_id`, `agent_id`) scope, including every null/value combination, and compares raw memory text after the hash lookup, guarding against hash collisions. This exact check does not depend on the semantic setting or an LLM.
+Phase-one exact matching runs on every write, but it is race-prone before migration `0008`: concurrent exact writes can both survive because no database uniqueness constraint serializes them. Each exact check uses the full (`user_id`, `agent_id`) scope, including every null/value combination, and compares raw memory text after the hash lookup, guarding against hash collisions. It does not depend on the semantic setting or an LLM. Concurrency-safe exact uniqueness begins only after production verification succeeds and the reviewed migration `0008` is created and applied.
 
 Semantic write-time deduplication defaults to **off**. Enable it with the switch at `Dashboard > System settings` after configuring its dedicated endpoint, model, and key. Only new writes are checked semantically; existing memories are not semantically consolidated. A duplicate paraphrase discards the new write and leaves the older canonical memory unchanged. Contradictions, temporal or state changes, material additions, subsets, supersets, and uncertain matches remain distinct memories. Simultaneous paraphrased writes are not serialized, so both writes can survive.
 
@@ -101,7 +101,7 @@ Example Hermes configuration:
 }
 ```
 
-`user_id` remains the profile boundary. Configure Hermes with a stable `MEM0_USER_ID` to merge one person's memories across gateways, or leave it unset to let Hermes use its gateway-native identity (for example, a Discord user ID). The API key only authenticates the trusted Hermes gateway; it does not bind a request to a user ID.
+`user_id` is supplied by the caller and remains the profile boundary. Configure Hermes with a stable `MEM0_USER_ID` to merge one person's memories across gateways, or let Hermes supply its gateway-native identity (for example, a Discord user ID). The Worker does not derive `user_id` from the API key. `agent_id` further partitions search and deduplication scope; different agent values, including null, remain separate scopes within the caller-supplied user identity.
 
 ## API
 
@@ -197,7 +197,7 @@ The dashboard offers:
 - **Memory graph** displays a selected user's stored entities and relationships as a bounded interactive graph; it is unavailable for agent entities.
 - **Import from Mem0** queues a `RawMemoryMigrationExport` for a chosen user or agent target.
 
-The **System settings** view contains the semantic memory deduplication switch. Exact write-time deduplication has no switch because it is always active. The old Dashboard cleanup control and endpoint no longer exist.
+The **System settings** view contains the semantic memory deduplication switch. Phase-one exact matching has no switch because it runs on every write, but it remains race-prone until migration `0008` adds database uniqueness. The old Dashboard cleanup control and endpoint no longer exist.
 
 The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
@@ -269,6 +269,8 @@ Prerequisite: a current Node.js/npm installation and a Cloudflare account for re
 npm install
 ```
 
+On Windows, use `npm.cmd` and `npx.cmd` when PowerShell execution policy blocks the `npm.ps1` or `npx.ps1` shims.
+
 Create `.dev.vars` (do not commit it):
 
 ```dotenv
@@ -301,7 +303,7 @@ DEDUP_CANDIDATE_LIMIT=8
 For Hermes, configure the Worker URL and shared key in the gateway environment:
 
 ```dotenv
-MEM0_HOST=https://your-worker.example.workers.dev
+MEM0_HOST=https://your-worker.example.workers.dev/v1
 MEM0_API_KEY=the-same-value-configured-as-the-Worker-secret
 MEM0_USER_ID=stable-user-identifier
 MEM0_AGENT_ID=hermes
@@ -331,6 +333,8 @@ npm run typecheck
 ## Provision Cloudflare resources
 
 `wrangler.toml` contains the current deployment's concrete D1 binding as a reference configuration. Forks and other operators must ensure `database_id` points to a D1 database in their own Cloudflare account, replacing the checked-in value only when their deployment flow does not do so. Existing operators should keep the valid checked-in binding when it already names the intended database.
+
+If the Deploy Button provisioned supported resources, verify each binding and skip the corresponding creation command below. The manual commands below are an alternative for resources that were not provisioned or selected by that flow. Migrations, metadata indexes, and secrets are still manual in either path.
 
 1. Verify the D1 binding. If the deployment does not already have its own database, create one:
 
@@ -362,12 +366,13 @@ npm run typecheck
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=actor_id --type=string
    npx wrangler vectorize create-metadata-index mem0-edge --property-name=scope_key --type=string
    npx wrangler vectorize create-metadata-index mem0-edge-entities --property-name=user_id --type=string
+   npx wrangler vectorize list-metadata-index mem0-edge
    ```
 
 5. Apply the D1 migrations from the configured `src/migrations` directory. Migration `0005_reflect_graph_indexes.sql` must be applied before deploying graph reflection:
 
    ```sh
-   npx wrangler d1 migrations apply mem0-edge --remote
+   npx wrangler d1 migrations apply DB --remote
    ```
 
 6. Set deployment secrets. Use strong, distinct values for the service API key and dashboard password:
@@ -389,14 +394,17 @@ For an existing deployment, create all four independent model credentials before
 
 Migration `0008` is intentionally not included in the repository yet. Keep the rollout in these production-gated phases:
 
-1. Deploy the application code and apply migration `0007_memory_deduplication_prepare.sql` only.
-2. Run `inspect` and review its report and backup.
-3. Pause writers and drain the queue according to your operator workflow.
-4. Run `apply --confirm`.
-5. Run `verify` and confirm that it succeeds in production.
-6. Only after successful production verification, create and apply migration `0008` to enforce the final exact-deduplication constraints.
+1. Apply migration `0007_memory_deduplication_prepare.sql` only with `npx wrangler d1 migrations apply DB --remote`, then create and verify the string `scope_key` Vectorize metadata index.
+2. Deploy phase-one code with semantic deduplication still off.
+3. Pause every write ingress, including Hermes and direct API mutations, Dashboard imports and reclassification, and any producer or dispatcher that can enqueue memory work.
+4. Drain the Queue completely, including active deliveries, retries, delayed messages, and backlog, and confirm no producer can refill it.
+5. Run `inspect` and review its report and backup.
+6. Run `apply --confirm`.
+7. Run `verify` and confirm that it succeeds in production.
+8. Only after successful production verification, create and apply migration `0008` while every writer remains paused. Review that migration before applying it with `npx wrangler d1 migrations apply DB --remote`.
+9. Resume writers only after migration `0008` has been applied and post-migration checks succeed.
 
-Do not resume writers between apply and verification. If `verify` reports asynchronous Vectorize cleanup still settling, keep writers paused and rerun it. Do not create migration `0008` based only on a local or staging result.
+Keep every writer paused from step 3 through step 8. If `verify` reports asynchronous Vectorize cleanup still settling, rerun it while writers remain paused. Do not create migration `0008` based only on a local or staging result, and do not resume any ingress before it is reviewed and applied.
 
 The package commands are:
 
