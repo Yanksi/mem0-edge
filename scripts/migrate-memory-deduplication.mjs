@@ -14,6 +14,7 @@ const ACCOUNT_PAGE_SIZE = 50;
 const MEMORY_PAGE_SIZE = 500;
 const D1_BATCH_SIZE = 50;
 const VECTOR_BATCH_SIZE = 100;
+const VECTOR_READ_BATCH_SIZE = 20;
 const VECTOR_MUTATION_TIMEOUT_MS = 2 * 60 * 1_000;
 const VECTOR_MUTATION_POLL_INTERVAL_MS = 1_000;
 const MEMORY_VECTOR_SCHEMA_VERSION = '1';
@@ -651,7 +652,7 @@ async function vectorMatchesRow(vector, row) {
 export async function pendingReindexRows({
   rows,
   getVectors,
-  vectorBatchSize = VECTOR_BATCH_SIZE,
+  vectorBatchSize = VECTOR_READ_BATCH_SIZE,
 }) {
   const activeRows = rows.filter((row) => row.deleted_at === null);
   const vectorsById = await vectorMapForRows({ rows: activeRows, getVectors, vectorBatchSize });
@@ -665,7 +666,7 @@ export async function pendingReindexRows({
 export async function verifyMemoryState({
   rows,
   getVectors,
-  vectorBatchSize = VECTOR_BATCH_SIZE,
+  vectorBatchSize = VECTOR_READ_BATCH_SIZE,
 }) {
   const hashUpdates = await pendingHashUpdates(rows);
   const updateIds = new Set(hashUpdates.map(({ id }) => id));

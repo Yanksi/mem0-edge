@@ -904,6 +904,48 @@ test('pendingReindexRows batches active vector reads and skips only fully conver
   ]);
 });
 
+test('pendingReindexRows respects the Vectorize get-by-ids limit by default', async () => {
+  const { pendingReindexRows, vectorStateHash } = await import('../migrate-memory-deduplication.mjs');
+  const rows = await Promise.all(Array.from({ length: 41 }, async (_, index) => {
+    const content = `memory-${index}`;
+    return {
+      id: `memory-${index}`,
+      user_id: 'user-1',
+      agent_id: null,
+      run_id: null,
+      actor_id: null,
+      metadata_json: '{}',
+      content,
+      content_hash: await contentHash(content),
+      created_at: index,
+      deleted_at: null,
+    };
+  }));
+  const calls = [];
+
+  const pending = await pendingReindexRows({
+    rows,
+    getVectors: async (ids) => {
+      calls.push(ids);
+      return Promise.all(ids.map(async (id) => {
+        const row = rows.find((candidate) => candidate.id === id);
+        return {
+          id,
+          metadata: {
+            scope_key: await scopeKey(row),
+            content_hash: row.content_hash,
+            memory_vector_schema: '1',
+            vector_state_hash: await vectorStateHash(row),
+          },
+        };
+      }));
+    },
+  });
+
+  assert.deepEqual(calls.map((ids) => ids.length), [20, 20, 1]);
+  assert.deepEqual(pending, []);
+});
+
 test('Cloudflare D1 client rejects an unsuccessful nested query result', async () => {
   const client = createCloudflareClient({
     token: 'token',
