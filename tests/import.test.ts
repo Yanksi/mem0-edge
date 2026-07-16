@@ -3,11 +3,21 @@ import type { Env } from '../src/env';
 
 const dependencies = vi.hoisted(() => ({
   embedText: vi.fn(),
+  prepareMemoryWrite: vi.fn(),
+  findActiveExactMemory: vi.fn(),
   upsertVectors: vi.fn(),
+  deleteVector: vi.fn(),
 }));
 
 vi.mock('../src/llm', () => ({ embedText: dependencies.embedText }));
-vi.mock('../src/vectorize', () => ({ upsertVectors: dependencies.upsertVectors }));
+vi.mock('../src/memory/deduplication', () => ({
+  prepareMemoryWrite: dependencies.prepareMemoryWrite,
+  findActiveExactMemory: dependencies.findActiveExactMemory,
+}));
+vi.mock('../src/vectorize', () => ({
+  upsertVectors: dependencies.upsertVectors,
+  deleteVector: dependencies.deleteVector,
+}));
 
 import { handleMemoryQueue } from '../src/queue';
 import worker from '../src/index';
@@ -29,7 +39,33 @@ const exportedMemory = {
   updated_at: null,
 };
 
-function durableImportDb(canonical = {
+type ImportRequestFixture = {
+  request_id: string;
+  entity_type: 'user' | 'agent';
+  entity_id: string;
+  item_json: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  lease_token: number;
+  attempt_count?: number;
+  cleanup_vector_id?: string | null;
+};
+
+const duplicateMemory = (id = 'canonical-memory-id') => ({
+  id,
+  userId: 'canonical-user',
+  agentId: null,
+  runId: null,
+  actorId: null,
+  content: exportedMemory.memory,
+  metadataJson: '{}',
+  hash: 'canonical-hash',
+  contentHash: 'content-hash',
+  createdAt: 1,
+  updatedAt: 1,
+  deletedAt: null,
+});
+
+function durableImportDb(canonical: ImportRequestFixture = {
   request_id: 'stable-memory-id',
   entity_type: 'user',
   entity_id: 'canonical-user',
@@ -37,11 +73,18 @@ function durableImportDb(canonical = {
   status: 'processing',
   lease_token: 7,
 }, options: {
-  claim?: typeof canonical | null;
+  claim?: ImportRequestFixture | null;
   completionChanges?: number;
-  existingRows?: Array<typeof canonical | null>;
+  existingRows?: Array<ImportRequestFixture | null>;
   dispatchRows?: Array<{ request_id: string; publish_token: number }>;
+  memoryInsertChanges?: number;
+  cleanupMarkerChanges?: number;
 } = {}) {
+  const canonicalRow = {
+    attempt_count: 1,
+    cleanup_vector_id: null,
+    ...canonical,
+  };
   const events: string[] = [];
   const statements: Array<{ sql: string; bindings: unknown[] }> = [];
   let existingRead = 0;
@@ -54,12 +97,12 @@ function durableImportDb(canonical = {
         return statement;
       }),
       first: vi.fn(async () => {
-        if (/UPDATE mem0_import_requests/i.test(sql) && /RETURNING/i.test(sql)) return options.claim === undefined ? canonical : options.claim;
+        if (/UPDATE mem0_import_requests/i.test(sql) && /RETURNING/i.test(sql)) return options.claim === undefined ? canonicalRow : options.claim;
         if (/SELECT/i.test(sql) && /FROM mem0_import_requests/i.test(sql)) {
           if (options.existingRows !== undefined && existingRead < options.existingRows.length) {
             return options.existingRows[existingRead++];
           }
-          return canonical;
+          return canonicalRow;
         }
         return null;
       }),
@@ -68,7 +111,15 @@ function durableImportDb(canonical = {
         results: /publish_token = publish_token \+ 1/i.test(sql) ? (options.dispatchRows ?? []) : [],
         meta: { changes: options.dispatchRows?.length ?? 0 },
       })),
-      run: vi.fn(async () => ({ success: true, results: [], meta: { changes: 1 } })),
+      run: vi.fn(async () => ({
+        success: true,
+        results: [],
+        meta: {
+          changes: /INSERT INTO memories/i.test(sql)
+            ? (options.memoryInsertChanges ?? 1)
+            : (/SET cleanup_vector_id = \?/i.test(sql) ? (options.cleanupMarkerChanges ?? 1) : 1),
+        },
+      })),
     };
     return statement;
   });
@@ -84,7 +135,15 @@ function durableImportDb(canonical = {
 }
 
 describe('Mem0 migration imports', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'content-hash',
+      exactScopeKey: 'scope-key',
+    });
+    dependencies.findActiveExactMemory.mockResolvedValue(undefined);
+    dependencies.deleteVector.mockResolvedValue(undefined);
+  });
 
   it('validates non-empty text and valid optional source timestamps', () => {
     expect(RawMemoryMigrationExport.safeParse({ memories: [exportedMemory] }).success).toBe(true);
@@ -116,6 +175,99 @@ describe('Mem0 migration imports', () => {
     expect(firstPass).toEqual(expect.arrayContaining([
       { body: expect.objectContaining({ type: 'import-mem0-memory', requestId: expect.any(String) }) },
     ]));
+  });
+
+  it('persists and counts exact duplicate export memories once', async () => {
+    const db = durableImportDb();
+    const sendBatch = vi.fn();
+    const duplicate = {
+      ...exportedMemory,
+      created_at: '2025-01-02T03:04:05.000Z',
+      updated_at: '2025-02-03T04:05:06.000Z',
+    };
+
+    await expect(enqueueMem0Import(
+      { ...env, DB: db, MEMORY_JOBS: { sendBatch } } as unknown as Env,
+      { entityType: 'user', entityId: 'user-123' },
+      { memories: [exportedMemory, duplicate] },
+    )).resolves.toBe(1);
+
+    const inserts = db.statements.filter(({ sql }) => /INSERT INTO mem0_import_requests/i.test(sql));
+    expect(inserts).toHaveLength(1);
+    expect(JSON.parse(inserts[0].bindings[3] as string)).toEqual(exportedMemory);
+  });
+
+  it('selects the earliest valid created_at before null or invalid duplicate dates', async () => {
+    const db = durableImportDb();
+    const selected = {
+      memory: exportedMemory.memory,
+      created_at: '2024-01-02T03:04:05.000Z',
+      updated_at: '2024-03-04T05:06:07.000Z',
+    };
+    const exportPayload = {
+      memories: [
+        { ...exportedMemory, created_at: null, updated_at: '2025-01-01T00:00:00.000Z' },
+        { ...exportedMemory, created_at: 'not-a-date', updated_at: '2026-01-01T00:00:00.000Z' },
+        { ...exportedMemory, created_at: '2024-02-03T04:05:06.000Z' },
+        selected,
+      ],
+    } as unknown as Parameters<typeof enqueueMem0Import>[2];
+
+    await enqueueMem0Import(
+      { ...env, DB: db, MEMORY_JOBS: { sendBatch: vi.fn() } } as unknown as Env,
+      { entityType: 'user', entityId: 'user-123' },
+      exportPayload,
+    );
+
+    const insert = db.statements.find(({ sql }) => /INSERT INTO mem0_import_requests/i.test(sql));
+    expect(JSON.parse(insert?.bindings[3] as string)).toEqual(selected);
+  });
+
+  it('uses original input order to break duplicate created_at ties', async () => {
+    const db = durableImportDb();
+    const first = {
+      memory: exportedMemory.memory,
+      created_at: exportedMemory.created_at,
+      updated_at: '2024-02-03T04:05:06.000Z',
+    };
+    const second = {
+      ...first,
+      updated_at: '2025-02-03T04:05:06.000Z',
+    };
+
+    await enqueueMem0Import(
+      { ...env, DB: db, MEMORY_JOBS: { sendBatch: vi.fn() } } as unknown as Env,
+      { entityType: 'user', entityId: 'user-123' },
+      { memories: [first, second] },
+    );
+
+    const inserts = db.statements.filter(({ sql }) => /INSERT INTO mem0_import_requests/i.test(sql));
+    expect(inserts).toHaveLength(1);
+    const [insert] = inserts;
+    expect(JSON.parse(insert?.bindings[3] as string)).toEqual(first);
+  });
+
+  it('keeps identical user-only and agent-only imports in separate durable identities', async () => {
+    const userDb = durableImportDb();
+    const agentDb = durableImportDb();
+    const memoryJobs = { sendBatch: vi.fn() };
+
+    await enqueueMem0Import(
+      { ...env, DB: userDb, MEMORY_JOBS: memoryJobs } as unknown as Env,
+      { entityType: 'user', entityId: 'shared-id' },
+      { memories: [exportedMemory] },
+    );
+    await enqueueMem0Import(
+      { ...env, DB: agentDb, MEMORY_JOBS: memoryJobs } as unknown as Env,
+      { entityType: 'agent', entityId: 'shared-id' },
+      { memories: [exportedMemory] },
+    );
+
+    const userInsert = userDb.statements.find(({ sql }) => /INSERT INTO mem0_import_requests/i.test(sql));
+    const agentInsert = agentDb.statements.find(({ sql }) => /INSERT INTO mem0_import_requests/i.test(sql));
+    expect(userInsert?.bindings.slice(1, 3)).toEqual(['user', 'shared-id']);
+    expect(agentInsert?.bindings.slice(1, 3)).toEqual(['agent', 'shared-id']);
+    expect(userInsert?.bindings[0]).not.toBe(agentInsert?.bindings[0]);
   });
 
   it('enqueues agent imports with an agent-only owner', async () => {
@@ -329,7 +481,7 @@ describe('Mem0 migration imports', () => {
     })).resolves.toBe('inflight');
 
     const publicationSql = db.statements.map(({ sql }) => sql).join('\n');
-    expect(publicationSql.match(/status = 'processing' AND lease_token = \?/gi)).toHaveLength(3);
+    expect(publicationSql.match(/status = 'processing' AND lease_token = \?/gi)).toHaveLength(4);
   });
 
   it('rejects a legacy queue body that conflicts with its canonical ledger row', async () => {
@@ -372,6 +524,172 @@ describe('Mem0 migration imports', () => {
 
     expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'failed'/i);
     expect(dependencies.embedText).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['exact', undefined],
+    ['semantic', [0.8, 0.2]],
+  ])('completes an %s storage duplicate without a new embedding, vector, or history row', async (_kind, embedding) => {
+    const db = durableImportDb();
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'content-hash',
+      exactScopeKey: 'scope-key',
+      duplicate: duplicateMemory(),
+      ...(embedding === undefined ? {} : { embedding }),
+    });
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.prepareMemoryWrite).toHaveBeenCalledWith(
+      expect.objectContaining({ DB: db }),
+      { userId: 'canonical-user', agentId: null },
+      exportedMemory.memory,
+    );
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/INSERT INTO (memories|memory_history)/i);
+    expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'completed'/i);
+  });
+
+  it('cleans a possible orphan request vector on retry before completing against another canonical row', async () => {
+    const db = durableImportDb({
+      request_id: 'stable-memory-id', entity_type: 'user', entity_id: 'canonical-user',
+      item_json: JSON.stringify(exportedMemory), status: 'processing', lease_token: 7,
+      attempt_count: 2,
+    });
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'content-hash', exactScopeKey: 'scope-key', duplicate: duplicateMemory(),
+    });
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(env.VECTORIZE, 'stable-memory-id');
+    const markerUpdates = db.statements.filter(({ sql }) => /SET cleanup_vector_id = \?/i.test(sql));
+    expect(markerUpdates.map(({ bindings }) => bindings[0])).toEqual(['stable-memory-id', null]);
+    const completionIndex = db.statements.findIndex(({ sql }) => /status = 'completed'/i.test(sql));
+    expect(db.statements.indexOf(markerUpdates[1])).toBeLessThan(completionIndex);
+  });
+
+  it('consumes a persisted cleanup marker before exact preparation and completion', async () => {
+    const db = durableImportDb({
+      request_id: 'stable-memory-id', entity_type: 'user', entity_id: 'canonical-user',
+      item_json: JSON.stringify(exportedMemory), status: 'processing', lease_token: 7,
+      attempt_count: 2, cleanup_vector_id: 'stable-memory-id',
+    });
+    dependencies.deleteVector.mockImplementation(async () => {
+      db.events.push('delete-pending');
+    });
+    dependencies.prepareMemoryWrite.mockImplementation(async () => {
+      db.events.push('prepare');
+      return { contentHash: 'content-hash', exactScopeKey: 'scope-key', duplicate: duplicateMemory() };
+    });
+
+    await processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    });
+
+    expect(db.events.slice(0, 2)).toEqual(['delete-pending', 'prepare']);
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(env.VECTORIZE, 'stable-memory-id');
+  });
+
+  it('preserves a cleanup marker on failure and consumes it on retry before completing', async () => {
+    const db = durableImportDb({
+      request_id: 'stable-memory-id', entity_type: 'user', entity_id: 'canonical-user',
+      item_json: JSON.stringify(exportedMemory), status: 'processing', lease_token: 7,
+      attempt_count: 2, cleanup_vector_id: 'stable-memory-id',
+    });
+    dependencies.deleteVector
+      .mockRejectedValueOnce(new Error('Vector cleanup unavailable'))
+      .mockResolvedValueOnce(undefined);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'content-hash', exactScopeKey: 'scope-key', duplicate: duplicateMemory(),
+    });
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).rejects.toThrow('Vector cleanup unavailable');
+    expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'failed'/i);
+    expect(db.statements.filter(({ sql }) => /SET cleanup_vector_id = \?/i.test(sql)))
+      .toHaveLength(1);
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).resolves.toBe('processed');
+    expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
+    expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'completed'/i);
+  });
+
+  it('reuses a distinct semantic preparation embedding and writes content identity metadata', async () => {
+    const db = durableImportDb();
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'prepared-content-hash', exactScopeKey: 'scope-key', embedding: [0.7, 0.3],
+    });
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+
+    await processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    });
+
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [{
+      id: 'stable-memory-id',
+      values: [0.7, 0.3],
+      metadata: expect.objectContaining({
+        user_id: 'canonical-user',
+        scope_key: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    }]);
+    const memoryInsert = db.statements.find(({ sql }) => /INSERT INTO memories/i.test(sql));
+    expect(memoryInsert?.sql).toMatch(/content_hash/i);
+    expect(memoryInsert?.bindings).toContain('prepared-content-hash');
+  });
+
+  it('does not complete a unique-index loser until its candidate vector is cleaned', async () => {
+    const db = durableImportDb(undefined, { memoryInsertChanges: 0 });
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'content-hash', exactScopeKey: 'scope-key', embedding: [0.7, 0.3],
+    });
+    dependencies.findActiveExactMemory.mockResolvedValue(duplicateMemory());
+    dependencies.upsertVectors.mockResolvedValue(undefined);
+    dependencies.deleteVector.mockRejectedValue(new Error('Vector cleanup unavailable'));
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).rejects.toThrow('Vector cleanup unavailable');
+
+    expect(dependencies.findActiveExactMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ DB: db }),
+      { userId: 'canonical-user', agentId: null },
+      exportedMemory.memory,
+      'content-hash',
+      'stable-memory-id',
+    );
+    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/status = 'completed'/i);
+    expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'failed'/i);
+  });
+
+  it('does not delete a vector when the cleanup marker cannot be fenced to its lease', async () => {
+    const db = durableImportDb({
+      request_id: 'stable-memory-id', entity_type: 'user', entity_id: 'canonical-user',
+      item_json: JSON.stringify(exportedMemory), status: 'processing', lease_token: 7,
+      attempt_count: 2,
+    }, { cleanupMarkerChanges: 0 });
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: 'content-hash', exactScopeKey: 'scope-key', duplicate: duplicateMemory(),
+    });
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).rejects.toThrow(/lease was replaced/i);
+
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/status = 'completed'/i);
   });
 
   it('directly embeds and stores the exact imported text with source timestamps', async () => {

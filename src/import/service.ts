@@ -1,7 +1,9 @@
 import type { Env, Mem0ImportJob, ReclassifyMem0AgentJob } from '../env';
 import { embedText } from '../llm';
+import { findActiveExactMemory, prepareMemoryWrite } from '../memory/deduplication';
+import { memoryVectorMetadata } from '../memory/identity';
 import { sha256Hex } from '../memory/idempotency';
-import { upsertVectors } from '../vectorize';
+import { deleteVector, upsertVectors } from '../vectorize';
 import {
   RawMemoryMigrationExport,
   RawMemoryMigrationItem,
@@ -19,13 +21,15 @@ interface ImportRequestRow {
   entity_id: string;
   item_json: string;
   status: 'queued' | 'processing' | 'completed' | 'failed';
+  attempt_count: number;
   lease_token: number;
+  cleanup_vector_id: string | null;
 }
 
 const IMPORT_PROCESSING_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_BATCH_SIZE = 100;
-const IMPORT_LEDGER_COLUMNS = 'request_id, entity_type, entity_id, item_json, status, lease_token';
+const IMPORT_LEDGER_COLUMNS = 'request_id, entity_type, entity_id, item_json, status, attempt_count, lease_token, cleanup_vector_id';
 
 export function isMem0ImportJob(value: unknown): value is Mem0ImportJob {
   if (typeof value !== 'object' || value === null) return false;
@@ -51,8 +55,10 @@ export async function enqueueMem0Import(
   scope: DashboardEntityScope,
   exportPayload: RawMemoryMigrationExportType,
 ): Promise<number> {
-  const exportId = await sha256Hex(JSON.stringify({ entity_type: scope.entityType, entity_id: scope.entityId, export: exportPayload }));
-  const jobs = await Promise.all(exportPayload.memories.map(async (item, index) => {
+  const selectedItems = selectUniqueImportItems(exportPayload.memories);
+  const selectedExport = { memories: selectedItems };
+  const exportId = await sha256Hex(JSON.stringify({ entity_type: scope.entityType, entity_id: scope.entityId, export: selectedExport }));
+  const jobs = await Promise.all(selectedItems.map(async (item, index) => {
     const requestId = await sha256Hex(`${scope.entityType}:${scope.entityId}:${exportId}:${index}`);
     return { requestId, item: RawMemoryMigrationItem.parse(item) };
   }));
@@ -72,7 +78,7 @@ export async function enqueueMem0Import(
     dispatched = await dispatchPendingMem0Imports(env);
   } while (dispatched === IMPORT_DISPATCH_BATCH_SIZE);
 
-  return exportPayload.memories.length;
+  return selectedItems.length;
 }
 
 export async function dispatchPendingMem0Imports(
@@ -128,72 +134,179 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
     source_created_at: sourceCreatedAt,
     source_updated_at: sourceUpdatedAt,
   };
-  const vectorMetadata = {
-    ...(claim.entity_type === 'user' ? { user_id: claim.entity_id } : { agent_id: claim.entity_id }),
-    source: metadata.source,
-    ...(metadata.source_created_at === null ? {} : { source_created_at: metadata.source_created_at }),
-    ...(metadata.source_updated_at === null ? {} : { source_updated_at: metadata.source_updated_at }),
-  };
   const metadataJson = JSON.stringify(metadata);
+  const scope = claim.entity_type === 'user'
+    ? { userId: claim.entity_id, agentId: null }
+    : { userId: null, agentId: claim.entity_id };
 
   try {
-    const embedding = await embedText(env, item.memory);
-    await upsertVectors(env.VECTORIZE, [{ id: claim.request_id, values: embedding, metadata: vectorMetadata }]);
+    const cleanedPendingVectorId = await cleanupPendingImportVector(env, claim);
+    const prepared = await prepareMemoryWrite(env, scope, item.memory);
+    if (prepared.duplicate !== undefined) {
+      if (prepared.duplicate.id === claim.request_id
+        || await findActiveImportMemoryById(env, claim.request_id)) {
+        return completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
+      }
+      if (claim.attempt_count > 1 && cleanedPendingVectorId !== claim.request_id) {
+        await cleanupImportVector(env, claim, claim.request_id);
+      }
+      return completeImportLease(env, claim, now);
+    }
 
-    const results = await env.DB.batch([
-      env.DB.prepare(`
-        INSERT INTO memories (
-          id, user_id, agent_id, run_id, actor_id, content, metadata_json,
-          hash, created_at, updated_at, deleted_at
-        )
-        SELECT ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL
-        FROM mem0_import_requests
-        WHERE request_id = ? AND status = 'processing' AND lease_token = ?
-        ON CONFLICT(id) DO NOTHING
-      `).bind(
-        claim.request_id,
-        claim.entity_type === 'user' ? claim.entity_id : null,
-        claim.entity_type === 'agent' ? claim.entity_id : null,
-        item.memory,
-        metadataJson,
-        claim.request_id,
-        createdAt,
-        updatedAt,
-        claim.request_id,
-        claim.lease_token,
-      ),
-      env.DB.prepare(`
-        INSERT INTO memory_history (
-          id, memory_id, operation, content, metadata_json, hash, created_at
-        )
-        SELECT ?, ?, 'ADD', ?, ?, ?, ?
-        FROM mem0_import_requests
-        WHERE request_id = ? AND status = 'processing' AND lease_token = ?
-          AND EXISTS (SELECT 1 FROM memories WHERE id = ?)
-        ON CONFLICT(id) DO NOTHING
-      `).bind(
-        `${claim.request_id}:import`,
-        claim.request_id,
-        item.memory,
-        metadataJson,
-        claim.request_id,
-        createdAt,
-        claim.request_id,
-        claim.lease_token,
-        claim.request_id,
-      ),
-      env.DB.prepare(`
-        UPDATE mem0_import_requests
-        SET status = 'completed', error_message = NULL, updated_at = ?, completed_at = ?
-        WHERE request_id = ? AND status = 'processing' AND lease_token = ?
-      `).bind(now, now, claim.request_id, claim.lease_token),
-    ]);
+    const row = {
+      userId: scope.userId,
+      agentId: scope.agentId,
+      runId: null,
+      actorId: null,
+      metadataJson,
+    };
+    const embedding = prepared.embedding ?? await embedText(env, item.memory);
+    if (!await hasActiveImportLease(env, claim)) return 'inflight';
+    await upsertVectors(env.VECTORIZE, [{ id: claim.request_id, values: embedding, metadata: await memoryVectorMetadata(row) }]);
 
-    return Number(results[2]?.meta.changes ?? 0) === 1 ? 'processed' : 'inflight';
+    const inserted = await env.DB.prepare(`
+      INSERT INTO memories (
+        id, user_id, agent_id, run_id, actor_id, content, metadata_json,
+        hash, content_hash, created_at, updated_at, deleted_at
+      )
+      SELECT ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL
+      FROM mem0_import_requests
+      WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      ON CONFLICT DO NOTHING
+    `).bind(
+      claim.request_id,
+      scope.userId,
+      scope.agentId,
+      item.memory,
+      metadataJson,
+      claim.request_id,
+      prepared.contentHash,
+      createdAt,
+      updatedAt,
+      claim.request_id,
+      claim.lease_token,
+    ).run();
+    if (Number(inserted.meta.changes ?? 0) === 1) {
+      return completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
+    }
+    if (!await hasActiveImportLease(env, claim)) return 'inflight';
+
+    const own = await findActiveImportMemoryById(env, claim.request_id);
+    if (own) return completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
+
+    const winner = await findActiveExactMemory(
+      env,
+      scope,
+      item.memory,
+      prepared.contentHash,
+      claim.request_id,
+    );
+    if (winner === undefined) {
+      await setImportCleanupVectorId(env, claim, claim.request_id);
+      throw new Error('Mem0 import insert conflict has no active exact winner');
+    }
+
+    await cleanupImportVector(env, claim, claim.request_id);
+    return completeImportLease(env, claim, now);
   } catch (error) {
     await failImportRequest(env, claim.request_id, claim.lease_token, error);
     throw error;
   }
+}
+
+async function cleanupPendingImportVector(env: Env, claim: ImportRequestRow): Promise<string | undefined> {
+  if (claim.cleanup_vector_id === null) return undefined;
+  await cleanupImportVector(env, claim, claim.cleanup_vector_id);
+  return claim.cleanup_vector_id;
+}
+
+async function cleanupImportVector(env: Env, claim: ImportRequestRow, vectorId: string): Promise<void> {
+  await setImportCleanupVectorId(env, claim, vectorId);
+  await deleteVector(env.VECTORIZE, vectorId);
+  await setImportCleanupVectorId(env, claim, null);
+}
+
+async function setImportCleanupVectorId(
+  env: Env,
+  claim: ImportRequestRow,
+  vectorId: string | null,
+): Promise<void> {
+  const result = await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET cleanup_vector_id = ?, updated_at = unixepoch()
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+  `).bind(vectorId, claim.request_id, claim.lease_token).run();
+  if (Number(result.meta.changes ?? 0) !== 1) {
+    throw new Error('Mem0 import lease was replaced during vector cleanup');
+  }
+}
+
+async function hasActiveImportLease(env: Env, claim: ImportRequestRow): Promise<boolean> {
+  const active = await env.DB.prepare(`
+    SELECT request_id
+    FROM mem0_import_requests
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+  `).bind(claim.request_id, claim.lease_token).first<{ request_id: string }>();
+  return active !== null;
+}
+
+async function findActiveImportMemoryById(env: Env, id: string): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL
+  `).bind(id).first<{ id: string }>();
+  return row !== null;
+}
+
+async function completeDeterministicImportLease(
+  env: Env,
+  claim: ImportRequestRow,
+  item: RawMemoryMigrationItem,
+  metadataJson: string,
+  createdAt: number,
+  now: number,
+): Promise<ProcessMem0ImportResult> {
+  const results = await env.DB.batch([
+    env.DB.prepare(`
+      INSERT INTO memory_history (
+        id, memory_id, operation, content, metadata_json, hash, created_at
+      )
+      SELECT ?, ?, 'ADD', ?, ?, ?, ?
+      FROM mem0_import_requests
+      WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+        AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL)
+      ON CONFLICT(id) DO NOTHING
+    `).bind(
+      `${claim.request_id}:import`,
+      claim.request_id,
+      item.memory,
+      metadataJson,
+      claim.request_id,
+      createdAt,
+      claim.request_id,
+      claim.lease_token,
+      claim.request_id,
+    ),
+    env.DB.prepare(`
+      UPDATE mem0_import_requests
+      SET status = 'completed', error_message = NULL, updated_at = ?, completed_at = ?
+      WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+        AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL)
+    `).bind(now, now, claim.request_id, claim.lease_token, claim.request_id),
+  ]);
+  return Number(results[1]?.meta.changes ?? 0) === 1 ? 'processed' : 'inflight';
+}
+
+async function completeImportLease(
+  env: Env,
+  claim: ImportRequestRow,
+  now: number,
+): Promise<ProcessMem0ImportResult> {
+  const result = await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET status = 'completed', error_message = NULL, updated_at = ?, completed_at = ?
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+  `).bind(now, now, claim.request_id, claim.lease_token).run();
+  return Number(result.meta.changes ?? 0) === 1 ? 'processed' : 'inflight';
 }
 
 async function ensureLegacyImportRequest(env: Env, job: Mem0ImportJob): Promise<void> {
@@ -329,6 +442,34 @@ function chunks<T>(items: T[], size: number): T[][] {
   const result: T[][] = [];
   for (let index = 0; index < items.length; index += size) result.push(items.slice(index, index + size));
   return result;
+}
+
+function selectUniqueImportItems(items: RawMemoryMigrationItem[]): RawMemoryMigrationItem[] {
+  const selected = new Map<string, { item: RawMemoryMigrationItem; index: number; createdAt?: number }>();
+  items.forEach((item, index) => {
+    const candidate = { item, index, createdAt: validSourceTimestamp(item.created_at) };
+    const current = selected.get(item.memory);
+    if (current === undefined || importItemPrecedes(candidate, current)) selected.set(item.memory, candidate);
+  });
+  return [...selected.values()].map(({ item }) => item);
+}
+
+function importItemPrecedes(
+  candidate: { index: number; createdAt?: number },
+  current: { index: number; createdAt?: number },
+): boolean {
+  if (candidate.createdAt !== undefined && current.createdAt === undefined) return true;
+  if (candidate.createdAt === undefined && current.createdAt !== undefined) return false;
+  if (candidate.createdAt !== undefined && current.createdAt !== undefined && candidate.createdAt !== current.createdAt) {
+    return candidate.createdAt < current.createdAt;
+  }
+  return candidate.index < current.index;
+}
+
+function validSourceTimestamp(value: string | null | undefined): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
 function scalarMetadata(value: string): Record<string, VectorizeVectorMetadataValue> {

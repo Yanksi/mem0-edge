@@ -8,12 +8,17 @@ import type { MemoryJob } from '../src/env';
 const dependencies = vi.hoisted(() => ({
   embedText: vi.fn(),
   upsertVectors: vi.fn(),
+  deleteVector: vi.fn(),
 }));
 
 vi.mock('../src/llm', () => ({ embedText: dependencies.embedText }));
-vi.mock('../src/vectorize', () => ({ upsertVectors: dependencies.upsertVectors }));
+vi.mock('../src/vectorize', () => ({
+  upsertVectors: dependencies.upsertVectors,
+  deleteVector: dependencies.deleteVector,
+}));
 
 import { dispatchPendingMem0Imports, processMem0ImportJob } from '../src/import/service';
+import { contentHash } from '../src/memory/identity';
 import { handleMemoryQueue } from '../src/queue';
 
 const env = workerEnv as unknown as Env;
@@ -29,6 +34,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   dependencies.embedText.mockResolvedValue([0.1, 0.2]);
   dependencies.upsertVectors.mockResolvedValue({ mutationId: 'mutation-1' });
+  dependencies.deleteVector.mockResolvedValue(undefined);
   await env.DB.prepare(`
     CREATE TABLE mem0_import_requests (
       request_id TEXT PRIMARY KEY,
@@ -44,15 +50,26 @@ beforeEach(async () => {
       error_message TEXT,
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-      completed_at INTEGER
+      completed_at INTEGER,
+      cleanup_vector_id TEXT
     )
   `).run();
   await env.DB.prepare(`
     CREATE TABLE memories (
       id TEXT PRIMARY KEY, user_id TEXT, agent_id TEXT, run_id TEXT, actor_id TEXT,
       content TEXT NOT NULL, metadata_json TEXT NOT NULL, hash TEXT NOT NULL,
-      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER
+      content_hash TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER
     )
+  `).run();
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX memories_active_user_content_hash_unique_idx
+    ON memories (user_id, content_hash)
+    WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NULL
+  `).run();
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX memories_active_agent_content_hash_unique_idx
+    ON memories (agent_id, content_hash)
+    WHERE deleted_at IS NULL AND user_id IS NULL AND agent_id IS NOT NULL
   `).run();
   await env.DB.prepare(`
     CREATE TABLE memory_history (
@@ -61,6 +78,14 @@ beforeEach(async () => {
       created_at INTEGER NOT NULL
     )
   `).run();
+  await env.DB.prepare(`
+    CREATE TABLE service_settings (
+      id INTEGER PRIMARY KEY NOT NULL,
+      semantic_dedup_enabled INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `).run();
+  await env.DB.prepare('INSERT INTO service_settings (id, semantic_dedup_enabled) VALUES (1, 0)').run();
 });
 
 async function seedRequest(status: 'queued' | 'failed' | 'processing', updatedAt: number, attemptCount = 0, leaseToken = 0) {
@@ -78,12 +103,27 @@ async function ledger() {
   `).first<{ status: string; attempt_count: number; lease_token: number }>();
 }
 
+async function cleanupMarker() {
+  return env.DB.prepare(`
+    SELECT cleanup_vector_id FROM mem0_import_requests WHERE request_id = 'request-1'
+  `).first<{ cleanup_vector_id: string | null }>();
+}
+
 async function publicationCounts() {
   const [memory, history] = await env.DB.batch<{ count: number }>([
     env.DB.prepare('SELECT COUNT(*) AS count FROM memories'),
     env.DB.prepare('SELECT COUNT(*) AS count FROM memory_history'),
   ]);
   return [memory.results[0].count, history.results[0].count];
+}
+
+async function seedCanonicalMemory(id: string, digest: string | null = null) {
+  await env.DB.prepare(`
+    INSERT INTO memories (
+      id, user_id, agent_id, run_id, actor_id, content, metadata_json,
+      hash, content_hash, created_at, updated_at, deleted_at
+    ) VALUES (?, 'user-1', NULL, NULL, NULL, ?, '{}', ?, ?, 1, 1, NULL)
+  `).bind(id, item.memory, id, digest).run();
 }
 
 function queueMessage(body: MemoryJob, attempts = 1): Message<MemoryJob> {
@@ -116,6 +156,16 @@ describe('durable Mem0 import processing', () => {
 
     await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 1, lease_token: 1 });
     await expect(publicationCounts()).resolves.toEqual([1, 1]);
+    await expect(env.DB.prepare(`
+      SELECT content_hash FROM memories WHERE id = 'request-1'
+    `).first()).resolves.toEqual({ content_hash: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(dependencies.upsertVectors).toHaveBeenCalledWith(expect.anything(), [expect.objectContaining({
+      id: 'request-1',
+      metadata: expect.objectContaining({
+        user_id: 'user-1',
+        scope_key: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    })]);
   });
 
   it('leaves a fresh processing lease inflight without side effects', async () => {
@@ -138,6 +188,101 @@ describe('durable Mem0 import processing', () => {
 
     await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 3, lease_token: 5 });
     await expect(publicationCounts()).resolves.toEqual([1, 1]);
+  });
+
+  it('completes an exact storage duplicate without embedding, vector mutation, or history', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    await seedCanonicalMemory('canonical-memory');
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 1, lease_token: 1 });
+  });
+
+  it('idempotently finishes history and completion when its deterministic row already exists', async () => {
+    await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
+    await seedCanonicalMemory('request-1');
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(publicationCounts()).resolves.toEqual([1, 1]);
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+  });
+
+  it('preserves its deterministic row when preparation selects an older exact canonical', async () => {
+    await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
+    await seedCanonicalMemory('canonical-memory');
+    await seedCanonicalMemory('request-1');
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    await expect(env.DB.prepare(`
+      SELECT COUNT(*) AS count FROM memory_history WHERE memory_id = 'request-1'
+    `).first()).resolves.toEqual({ count: 1 });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+  });
+
+  it('cleans an unmarked retry vector before completing against another canonical row', async () => {
+    await seedRequest('failed', Math.floor(Date.now() / 1000), 1, 1);
+    await seedCanonicalMemory('canonical-memory');
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(expect.anything(), 'request-1');
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: null });
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+  });
+
+  it('keeps a unique-race loser failed until orphan cleanup succeeds on retry', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const digest = await contentHash(item.memory);
+    dependencies.upsertVectors.mockImplementationOnce(async () => {
+      await seedCanonicalMemory('concurrent-canonical', digest);
+      return { mutationId: 'mutation-1' };
+    });
+    dependencies.deleteVector
+      .mockRejectedValueOnce(new Error('Vector cleanup unavailable'))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).rejects.toThrow('Vector cleanup unavailable');
+
+    await expect(ledger()).resolves.toEqual({ status: 'failed', attempt_count: 1, lease_token: 1 });
+    await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: 'request-1' });
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
+    expect(dependencies.upsertVectors).toHaveBeenCalledOnce();
+    expect(dependencies.embedText).toHaveBeenCalledOnce();
+    await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: null });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
   });
 
   it('cannot publish D1 rows after its lease is replaced during Vectorize mutation', async () => {
