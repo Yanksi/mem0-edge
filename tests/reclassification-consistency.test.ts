@@ -270,6 +270,79 @@ describe('agent reclassification consistency', () => {
     expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'z-target');
   });
 
+  it('moves a paired user-agent source into the target agent-only scope', async () => {
+    const digest = await contentHash(content);
+    await seedMemory({
+      id: 'source-memory',
+      userId: 'legacy-user',
+      agentId: 'existing-agent',
+      createdAt: 1,
+      digest: null,
+      metadataJson: JSON.stringify({ label: 'paired', user_id: 'spoofed', agent_id: 'spoofed' }),
+    });
+
+    await processMem0AgentReclassificationJob(testEnv(), job);
+
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({
+      user_id: null,
+      agent_id: 'agent-1',
+      content_hash: digest,
+      deleted_at: null,
+    }));
+    expect(dependencies.upsertVectors).toHaveBeenCalledWith(vectorIndex, [{
+      id: 'source-memory',
+      values: [0.2, 0.8],
+      metadata: {
+        label: 'paired',
+        agent_id: 'agent-1',
+        run_id: 'run-1',
+        actor_id: 'actor-1',
+        scope_key: await scopeKey({ userId: null, agentId: 'agent-1' }),
+      },
+    }]);
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+  });
+
+  it('guards the observed agent on a paired collision before retrying with the new snapshot', async () => {
+    const digest = await contentHash(content);
+    await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: 'existing-agent', createdAt: 2, digest });
+    await seedMemory({ id: 'target-memory', userId: null, agentId: 'agent-1', createdAt: 1, digest });
+    await seedGraph();
+    let batchCalls = 0;
+    const racingDb = {
+      prepare: db.prepare.bind(db),
+      batch: async <T>(statements: D1PreparedStatement[]) => {
+        batchCalls += 1;
+        if (batchCalls === 1) {
+          await db.prepare(`
+            UPDATE memories SET agent_id = 'raced-agent' WHERE id = 'source-memory'
+          `).run();
+        }
+        return db.batch<T>(statements);
+      },
+    } as unknown as D1Database;
+
+    await processMem0AgentReclassificationJob(testEnv(racingDb), job);
+
+    expect(batchCalls).toBe(2);
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({
+      agent_id: 'raced-agent',
+      deleted_at: expect.any(Number),
+    }));
+    expect(await graphState()).toEqual({
+      links: [
+        { memory_id: 'source-memory', entity_id: 'entity-source', created_at: 11 },
+        { memory_id: 'target-memory', entity_id: 'entity-source', created_at: 11 },
+        { memory_id: 'target-memory', entity_id: 'entity-target', created_at: 12 },
+      ],
+      relationships: [
+        { id: 'relationship-source', evidence_memory_id: 'target-memory' },
+        { id: 'relationship-target', evidence_memory_id: 'target-memory' },
+      ],
+    });
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'source-memory');
+  });
+
   it.each([
     ['edited', "UPDATE memories SET content = 'Edited after lookup', content_hash = 'edited-hash' WHERE id = 'source-memory'"],
     ['moved', "UPDATE memories SET user_id = NULL, agent_id = 'other-agent' WHERE id = 'source-memory'"],

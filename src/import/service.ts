@@ -1123,7 +1123,6 @@ function isExpectedSource(
   digest: string,
 ): boolean {
   return source.userId === job.sourceUserId
-    && source.agentId === null
     && source.content === job.content
     && (source.contentHash === null || source.contentHash === digest);
 }
