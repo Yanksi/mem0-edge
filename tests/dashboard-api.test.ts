@@ -54,6 +54,7 @@ describe('dashboard operator API', () => {
     const responses = await Promise.all([
       worker.fetch(request('/dashboard/api/users/discord%3A42/alias', { method: 'PUT', headers, body: 'not-json' }), readOnlyEnv),
       worker.fetch(request('/dashboard/api/settings', { method: 'PUT', headers, body: 'not-json' }), readOnlyEnv),
+      worker.fetch(request('/dashboard/api/memories/memory-1/reindex', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
       worker.fetch(request('/dashboard/api/imports/mem0', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
       worker.fetch(request('/dashboard/api/entities/reclassify-agent', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
     ]);
@@ -64,6 +65,7 @@ describe('dashboard operator API', () => {
     }
     expect(dashboardService.setDashboardUserAlias).not.toHaveBeenCalled();
     expect(dashboardService.setDashboardSettings).not.toHaveBeenCalled();
+    expect(dashboardService.reindexDashboardMemory).not.toHaveBeenCalled();
     expect(importService.enqueueMem0Import).not.toHaveBeenCalled();
     expect(importService.enqueueMem0AgentReclassification).not.toHaveBeenCalled();
   });

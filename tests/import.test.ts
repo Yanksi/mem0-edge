@@ -194,6 +194,8 @@ function reclassificationDb(updatedRow?: {
     const call = { sql, bindings: [] as unknown[] };
     statements.push(call);
     const statement = {
+      sql,
+      get bindings() { return call.bindings; },
       bind: vi.fn((...bindings: unknown[]) => {
         call.bindings = bindings;
         return statement;
@@ -221,8 +223,21 @@ function reclassificationDb(updatedRow?: {
     };
     return statement;
   });
-  const batch = vi.fn(async (items: unknown[]) => {
-    if (items.length === 3) source = { ...source, deletedAt: 1 };
+  const batch = vi.fn(async (items: Array<{ sql: string; bindings: unknown[] }>) => {
+    for (const item of items) {
+      if (/SET user_id = NULL, agent_id = \?/i.test(item.sql)) {
+        source = {
+          ...source,
+          userId: null,
+          agentId: item.bindings[0] as string,
+          contentHash: source.contentHash ?? item.bindings[1] as string,
+          ...(updatedRow ?? {}),
+        };
+      }
+      if (/SET deleted_at = unixepoch\(\)/i.test(item.sql) && item.bindings[0] === source.id) {
+        source = { ...source, deletedAt: 1 };
+      }
+    }
     return items.map(() => ({
       success: true,
       results: [],
@@ -975,6 +990,9 @@ describe('Mem0 agent reclassification', () => {
     expect(update?.bindings).toEqual(expect.arrayContaining([
       'agent-1', digest, 'source-memory', 'legacy-agent-user',
     ]));
+    expect(db.batch).toHaveBeenCalledOnce();
+    expect(db.statements.some(({ sql }) => /DELETE FROM relationships/i.test(sql))).toBe(true);
+    expect(db.statements.some(({ sql }) => /DELETE FROM memory_entity_links/i.test(sql))).toBe(true);
     expect(dependencies.embedText).toHaveBeenCalledWith(expect.objectContaining({ DB: db }), job.content);
     expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [{
       id: 'source-memory',
@@ -996,7 +1014,7 @@ describe('Mem0 agent reclassification', () => {
     expect(dependencies.deleteVector).not.toHaveBeenCalled();
   });
 
-  it('keeps the older exact target canonical and atomically rewires the source graph before deleting its vector', async () => {
+  it('keeps the older exact target canonical and atomically removes both graphs before deleting its vector', async () => {
     const db = reclassificationDb();
     const canonicalTarget = {
       id: 'older-target',
@@ -1029,16 +1047,16 @@ describe('Mem0 agent reclassification', () => {
     expect(db.batch).toHaveBeenCalledOnce();
     const [firstBatch] = db.batch.mock.calls[0];
     expect(firstBatch).toHaveLength(3);
-    const copyLinks = db.statements.find(({ sql }) => /INSERT OR IGNORE INTO memory_entity_links/i.test(sql))!;
-    const rewireRelationships = db.statements.find(({ sql }) => /UPDATE relationships/i.test(sql))!;
+    const deleteLinks = db.statements.find(({ sql }) => /DELETE FROM memory_entity_links/i.test(sql))!;
+    const deleteRelationships = db.statements.find(({ sql }) => /DELETE FROM relationships/i.test(sql))!;
     const softDeleteSource = db.statements.find(({ sql }) => /SET deleted_at = unixepoch\(\)/i.test(sql))!;
-    expect(copyLinks.sql).toMatch(/INSERT OR IGNORE INTO memory_entity_links[\s\S]*SELECT \?, links\.entity_id, links\.created_at[\s\S]*WHERE links\.memory_id = \?/i);
-    expect(copyLinks.bindings.slice(0, 2)).toEqual(['older-target', 'source-memory']);
-    expect(copyLinks.bindings).toEqual(expect.arrayContaining([
+    expect(deleteLinks.sql).toMatch(/DELETE FROM memory_entity_links\s+WHERE memory_id IN \(\?, \?\)/i);
+    expect(deleteLinks.bindings.slice(0, 2)).toEqual(['source-memory', 'older-target']);
+    expect(deleteLinks.bindings).toEqual(expect.arrayContaining([
       'source-memory', 'legacy-agent-user', 'source-hash', 'older-target', 'target-hash',
     ]));
-    expect(rewireRelationships.sql).toMatch(/UPDATE relationships\s+SET evidence_memory_id = \?\s+WHERE evidence_memory_id = \?/i);
-    expect(rewireRelationships.bindings.slice(0, 2)).toEqual(['older-target', 'source-memory']);
+    expect(deleteRelationships.sql).toMatch(/DELETE FROM relationships\s+WHERE evidence_memory_id IN \(\?, \?\)/i);
+    expect(deleteRelationships.bindings.slice(0, 2)).toEqual(['source-memory', 'older-target']);
     expect(softDeleteSource.sql).toMatch(/UPDATE memories\s+SET deleted_at = unixepoch\(\)\s+WHERE id = \?[\s\S]*guarded\.deleted_at IS NULL/i);
     expect(softDeleteSource.bindings[0]).toBe('source-memory');
     expect(softDeleteSource.bindings).toContain('older-target');

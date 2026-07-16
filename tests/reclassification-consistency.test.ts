@@ -144,6 +144,20 @@ async function seedGraph(sourceEvidenceId = 'source-memory', targetEvidenceId = 
   ]);
 }
 
+async function seedSourceGraph(): Promise<void> {
+  await db.batch([
+    db.prepare(`
+      INSERT INTO memory_entity_links (memory_id, entity_id, created_at)
+      VALUES ('source-memory', 'entity-source', 11)
+    `),
+    db.prepare(`
+      INSERT INTO relationships (
+        id, user_id, source_entity_id, target_entity_id, relation_type, evidence_memory_id
+      ) VALUES ('relationship-source', 'legacy-user', 'entity-source', 'entity-target', 'knows', 'source-memory')
+    `),
+  ]);
+}
+
 async function memory(id: string) {
   return db.prepare(`
     SELECT id, user_id, agent_id, content, metadata_json, hash, content_hash,
@@ -180,7 +194,7 @@ function beforeFirstBatch(action: () => Promise<void>): D1Database {
 }
 
 describe('agent reclassification consistency', () => {
-  it('keeps an older target canonical and merges the later source graph into it', async () => {
+  it('keeps an older target canonical and removes graph state for both memories', async () => {
     const digest = await contentHash(content);
     await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 2, digest: null });
     await seedMemory({ id: 'target-memory', userId: null, agentId: 'agent-1', createdAt: 1, digest: null, hash: 'canonical-hash' });
@@ -197,22 +211,12 @@ describe('agent reclassification consistency', () => {
       deleted_at: null,
     }));
     expect(await memory('source-memory')).toEqual(expect.objectContaining({ deleted_at: expect.any(Number) }));
-    expect(await graphState()).toEqual({
-      links: [
-        { memory_id: 'source-memory', entity_id: 'entity-source', created_at: 11 },
-        { memory_id: 'target-memory', entity_id: 'entity-source', created_at: 11 },
-        { memory_id: 'target-memory', entity_id: 'entity-target', created_at: 12 },
-      ],
-      relationships: [
-        { id: 'relationship-source', evidence_memory_id: 'target-memory' },
-        { id: 'relationship-target', evidence_memory_id: 'target-memory' },
-      ],
-    });
+    expect(await graphState()).toEqual({ links: [], relationships: [] });
     expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'source-memory');
     expect(dependencies.upsertVectors).not.toHaveBeenCalled();
   });
 
-  it('keeps an older source canonical, soft-deletes the target before moving, and reindexes the source scope', async () => {
+  it('keeps an older source canonical, removes both graphs, and reindexes the source scope', async () => {
     const digest = await contentHash(content);
     const metadataJson = JSON.stringify({ label: 'source', agent_id: 'spoofed', scope_key: 'spoofed' });
     await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 1, digest: null, metadataJson, hash: 'source-hash' });
@@ -232,17 +236,7 @@ describe('agent reclassification consistency', () => {
       hash: 'target-hash',
       deleted_at: expect.any(Number),
     }));
-    expect(await graphState()).toEqual({
-      links: [
-        { memory_id: 'source-memory', entity_id: 'entity-source', created_at: 11 },
-        { memory_id: 'source-memory', entity_id: 'entity-target', created_at: 12 },
-        { memory_id: 'target-memory', entity_id: 'entity-target', created_at: 12 },
-      ],
-      relationships: [
-        { id: 'relationship-source', evidence_memory_id: 'source-memory' },
-        { id: 'relationship-target', evidence_memory_id: 'source-memory' },
-      ],
-    });
+    expect(await graphState()).toEqual({ links: [], relationships: [] });
     expect(dependencies.upsertVectors).toHaveBeenCalledWith(vectorIndex, [{
       id: 'source-memory',
       values: [0.2, 0.8],
@@ -274,6 +268,22 @@ describe('agent reclassification consistency', () => {
     expect(await memory('a-source')).toEqual(expect.objectContaining({ agent_id: 'agent-1', deleted_at: null }));
     expect(await memory('z-target')).toEqual(expect.objectContaining({ deleted_at: expect.any(Number) }));
     expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'z-target');
+  });
+
+  it('atomically removes graph state when moving without a collision', async () => {
+    const digest = await contentHash(content);
+    await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 1, digest });
+    await seedSourceGraph();
+
+    await processMem0AgentReclassificationJob(testEnv(), job);
+
+    expect(await memory('source-memory')).toEqual(expect.objectContaining({
+      user_id: null,
+      agent_id: 'agent-1',
+      deleted_at: null,
+    }));
+    expect(await graphState()).toEqual({ links: [], relationships: [] });
+    expect(dependencies.upsertVectors).toHaveBeenCalledOnce();
   });
 
   it('moves a paired user-agent source into the target agent-only scope', async () => {
@@ -342,17 +352,7 @@ describe('agent reclassification consistency', () => {
       agent_id: 'raced-agent',
       deleted_at: expect.any(Number),
     }));
-    expect(await graphState()).toEqual({
-      links: [
-        { memory_id: 'source-memory', entity_id: 'entity-source', created_at: 11 },
-        { memory_id: 'target-memory', entity_id: 'entity-source', created_at: 11 },
-        { memory_id: 'target-memory', entity_id: 'entity-target', created_at: 12 },
-      ],
-      relationships: [
-        { id: 'relationship-source', evidence_memory_id: 'target-memory' },
-        { id: 'relationship-target', evidence_memory_id: 'target-memory' },
-      ],
-    });
+    expect(await graphState()).toEqual({ links: [], relationships: [] });
     expect(dependencies.deleteVector).toHaveBeenCalledWith(vectorIndex, 'source-memory');
   });
 
@@ -385,8 +385,6 @@ describe('agent reclassification consistency', () => {
     await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 2, digest });
     await seedMemory({ id: 'target-memory', userId: null, agentId: 'agent-1', createdAt: 1, digest });
     await seedGraph();
-    const originalGraph = await graphState();
-
     await processMem0AgentReclassificationJob(testEnv(beforeFirstBatch(async () => {
       await db.prepare(mutation).run();
     })), job);
@@ -396,7 +394,10 @@ describe('agent reclassification consistency', () => {
       agent_id: 'agent-1',
       deleted_at: null,
     }));
-    expect(await graphState()).toEqual(originalGraph);
+    expect(await graphState()).toEqual({
+      links: [{ memory_id: 'target-memory', entity_id: 'entity-target', created_at: 12 }],
+      relationships: [{ id: 'relationship-target', evidence_memory_id: 'target-memory' }],
+    });
     expect(dependencies.upsertVectors).toHaveBeenCalledOnce();
     expect(dependencies.deleteVector).not.toHaveBeenCalled();
   });
@@ -426,28 +427,9 @@ describe('agent reclassification consistency', () => {
   it('recovers a prospective unique-index race by re-reading and merging the new target', async () => {
     const digest = await contentHash(content);
     await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 2, digest });
-    let inserted = false;
-    const racingDb = {
-      prepare(sql: string) {
-        const prepared = db.prepare(sql);
-        if (!inserted && /SET user_id = NULL, agent_id = \?/i.test(sql) && /RETURNING/i.test(sql)) {
-          return {
-            bind: (...bindings: unknown[]) => {
-              const bound = prepared.bind(...bindings);
-              return {
-                first: async <T>() => {
-                  inserted = true;
-                  await seedMemory({ id: 'racing-target', userId: null, agentId: 'agent-1', createdAt: 1, digest });
-                  return bound.first<T>();
-                },
-              } as unknown as D1PreparedStatement;
-            },
-          } as unknown as D1PreparedStatement;
-        }
-        return prepared;
-      },
-      batch: db.batch.bind(db),
-    } as unknown as D1Database;
+    const racingDb = beforeFirstBatch(async () => {
+      await seedMemory({ id: 'racing-target', userId: null, agentId: 'agent-1', createdAt: 1, digest });
+    });
 
     await processMem0AgentReclassificationJob(testEnv(racingDb), job);
 
@@ -460,28 +442,9 @@ describe('agent reclassification consistency', () => {
     const digest = await contentHash(content);
     await db.prepare('DROP INDEX memories_active_agent_content_hash_unique_idx').run();
     await seedMemory({ id: 'source-memory', userId: 'legacy-user', agentId: null, createdAt: 2, digest });
-    let inserted = false;
-    const racingDb = {
-      prepare(sql: string) {
-        const prepared = db.prepare(sql);
-        if (!inserted && /SET user_id = NULL, agent_id = \?/i.test(sql) && /RETURNING/i.test(sql)) {
-          return {
-            bind: (...bindings: unknown[]) => {
-              const bound = prepared.bind(...bindings);
-              return {
-                first: async <T>() => {
-                  inserted = true;
-                  await seedMemory({ id: 'phase-one-target', userId: null, agentId: 'agent-1', createdAt: 1, digest });
-                  return bound.first<T>();
-                },
-              } as unknown as D1PreparedStatement;
-            },
-          } as unknown as D1PreparedStatement;
-        }
-        return prepared;
-      },
-      batch: db.batch.bind(db),
-    } as unknown as D1Database;
+    const racingDb = beforeFirstBatch(async () => {
+      await seedMemory({ id: 'phase-one-target', userId: null, agentId: 'agent-1', createdAt: 1, digest });
+    });
 
     await processMem0AgentReclassificationJob(testEnv(racingDb), job);
 

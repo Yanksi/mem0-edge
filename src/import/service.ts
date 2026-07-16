@@ -926,45 +926,58 @@ async function moveReclassifiedMemory(
   job: ReclassifyMem0AgentJob,
   digest: string,
 ): Promise<ReclassificationMemoryRow | null> {
-  return env.DB.prepare(`
-    UPDATE memories
-    SET user_id = NULL, agent_id = ?, content_hash = COALESCE(content_hash, ?)
-    WHERE id = ?
-      AND user_id IS ?
-      AND agent_id IS ?
-      AND content = ?
-      AND hash = ?
-      AND content_hash IS ?
-      AND created_at = ?
-      AND deleted_at IS NULL
-      AND NOT EXISTS (
-        SELECT 1
-        FROM memories AS target
-        WHERE target.id <> ?
-          AND target.user_id IS NULL
-          AND target.agent_id = ?
-          AND target.content = ?
-          AND (target.content_hash = ? OR target.content_hash IS NULL)
-          AND target.deleted_at IS NULL
-      )
-    RETURNING id, user_id AS userId, agent_id AS agentId, run_id AS runId,
-      actor_id AS actorId, content, metadata_json AS metadataJson, hash,
-      content_hash AS contentHash, created_at AS createdAt, deleted_at AS deletedAt
-  `).bind(
-    job.agentId,
-    digest,
-    source.id,
-    source.userId,
-    source.agentId,
-    source.content,
-    source.hash,
-    source.contentHash,
-    source.createdAt,
-    source.id,
-    job.agentId,
-    job.content,
-    digest,
-  ).first<ReclassificationMemoryRow>();
+  const movedSource = targetScopedReclassificationRow(source, job.agentId, digest);
+  const results = await env.DB.batch([
+    env.DB.prepare(`
+      UPDATE memories
+      SET user_id = NULL, agent_id = ?, content_hash = COALESCE(content_hash, ?)
+      WHERE id = ?
+        AND user_id IS ?
+        AND agent_id IS ?
+        AND content = ?
+        AND hash = ?
+        AND content_hash IS ?
+        AND created_at = ?
+        AND deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM memories AS target
+          WHERE target.id <> ?
+            AND target.user_id IS NULL
+            AND target.agent_id = ?
+            AND target.content = ?
+            AND (target.content_hash = ? OR target.content_hash IS NULL)
+            AND target.deleted_at IS NULL
+        )
+    `).bind(
+      job.agentId,
+      digest,
+      source.id,
+      source.userId,
+      source.agentId,
+      source.content,
+      source.hash,
+      source.contentHash,
+      source.createdAt,
+      source.id,
+      job.agentId,
+      job.content,
+      digest,
+    ),
+    env.DB.prepare(`
+      DELETE FROM relationships
+      WHERE evidence_memory_id = ?
+        AND ${ACTIVE_MEMORY_GUARD}
+    `).bind(source.id, ...activeMemoryBindings(movedSource)),
+    env.DB.prepare(`
+      DELETE FROM memory_entity_links
+      WHERE memory_id = ?
+        AND ${ACTIVE_MEMORY_GUARD}
+    `).bind(source.id, ...activeMemoryBindings(movedSource)),
+  ]);
+  return Number(results[0]?.meta.changes ?? 0) === 1
+    ? findReclassificationMemory(env, source.id)
+    : null;
 }
 
 async function reindexReclassifiedMemory(env: Env, source: ReclassificationMemoryRow): Promise<void> {
@@ -1015,29 +1028,26 @@ async function mergeSourceIntoTarget(
   const guard = [...activeMemoryBindings(source), ...activeMemoryBindings(target)];
   const results = await env.DB.batch([
     env.DB.prepare(`
-      INSERT OR IGNORE INTO memory_entity_links (memory_id, entity_id, created_at)
-      SELECT ?, links.entity_id, links.created_at
-      FROM memory_entity_links AS links
-      WHERE links.memory_id = ?
-        AND ${ACTIVE_MEMORY_GUARD}
-        AND ${ACTIVE_MEMORY_GUARD}
-    `).bind(target.id, source.id, ...guard),
-    env.DB.prepare(`
-      UPDATE relationships
-      SET evidence_memory_id = ?
-      WHERE evidence_memory_id = ?
-        AND ${ACTIVE_MEMORY_GUARD}
-        AND ${ACTIVE_MEMORY_GUARD}
-    `).bind(target.id, source.id, ...guard),
-    env.DB.prepare(`
       UPDATE memories
       SET deleted_at = unixepoch()
       WHERE id = ?
         AND ${ACTIVE_MEMORY_GUARD}
         AND ${ACTIVE_MEMORY_GUARD}
     `).bind(source.id, ...guard),
+    env.DB.prepare(`
+      DELETE FROM relationships
+      WHERE evidence_memory_id IN (?, ?)
+        AND ${DELETED_MEMORY_GUARD}
+        AND ${ACTIVE_MEMORY_GUARD}
+    `).bind(source.id, target.id, ...guard),
+    env.DB.prepare(`
+      DELETE FROM memory_entity_links
+      WHERE memory_id IN (?, ?)
+        AND ${DELETED_MEMORY_GUARD}
+        AND ${ACTIVE_MEMORY_GUARD}
+    `).bind(source.id, target.id, ...guard),
   ]);
-  return Number(results[2]?.meta.changes ?? 0) === 1;
+  return Number(results[0]?.meta.changes ?? 0) === 1;
 }
 
 async function mergeTargetIntoSource(
@@ -1048,23 +1058,12 @@ async function mergeTargetIntoSource(
   digest: string,
 ): Promise<boolean> {
   const activeGuard = [...activeMemoryBindings(source), ...activeMemoryBindings(target)];
+  const movedGuard = [
+    ...activeMemoryBindings(targetScopedReclassificationRow(source, agentId, digest)),
+    ...activeMemoryBindings(target),
+  ];
   // The final move is permitted only when this transaction's immediately preceding guard tombstoned the target.
   const results = await env.DB.batch([
-    env.DB.prepare(`
-      INSERT OR IGNORE INTO memory_entity_links (memory_id, entity_id, created_at)
-      SELECT ?, links.entity_id, links.created_at
-      FROM memory_entity_links AS links
-      WHERE links.memory_id = ?
-        AND ${ACTIVE_MEMORY_GUARD}
-        AND ${ACTIVE_MEMORY_GUARD}
-    `).bind(source.id, target.id, ...activeGuard),
-    env.DB.prepare(`
-      UPDATE relationships
-      SET evidence_memory_id = ?
-      WHERE evidence_memory_id = ?
-        AND ${ACTIVE_MEMORY_GUARD}
-        AND ${ACTIVE_MEMORY_GUARD}
-    `).bind(source.id, target.id, ...activeGuard),
     env.DB.prepare(`
       UPDATE memories
       SET deleted_at = unixepoch()
@@ -1087,9 +1086,29 @@ async function mergeTargetIntoSource(
       ...activeMemoryBindings(source),
       ...activeMemoryBindings(target),
     ),
+    env.DB.prepare(`
+      DELETE FROM relationships
+      WHERE evidence_memory_id IN (?, ?)
+        AND ${ACTIVE_MEMORY_GUARD}
+        AND ${DELETED_MEMORY_GUARD}
+    `).bind(source.id, target.id, ...movedGuard),
+    env.DB.prepare(`
+      DELETE FROM memory_entity_links
+      WHERE memory_id IN (?, ?)
+        AND ${ACTIVE_MEMORY_GUARD}
+        AND ${DELETED_MEMORY_GUARD}
+    `).bind(source.id, target.id, ...movedGuard),
   ]);
-  return Number(results[2]?.meta.changes ?? 0) === 1
-    && Number(results[3]?.meta.changes ?? 0) === 1;
+  return Number(results[0]?.meta.changes ?? 0) === 1
+    && Number(results[1]?.meta.changes ?? 0) === 1;
+}
+
+function targetScopedReclassificationRow(
+  source: ReclassificationMemoryRow,
+  agentId: string,
+  digest: string,
+): ReclassificationMemoryRow {
+  return { ...source, userId: null, agentId, contentHash: source.contentHash ?? digest };
 }
 
 function activeMemoryBindings(row: ReclassificationMemoryRow): unknown[] {
