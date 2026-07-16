@@ -324,6 +324,11 @@ async function createMemoriesForLease(
 
     const prepared = await prepareMemoryWrite(env, scope, content);
     if (prepared.duplicate !== undefined) {
+      if (prepared.duplicate.id === id) {
+        await repairCreatedMemory(db, env, prepared.duplicate, candidate);
+      } else if (claim.candidatesJson !== null) {
+        await cleanupCandidateVector(db, env, request.user_id, hash, claim.leaseToken, id);
+      }
       responses.push(toResponse(prepared.duplicate));
       continue;
     }
@@ -365,13 +370,24 @@ async function createMemoriesForLease(
       throw new TransientMemoryJobError('Memory insert conflict has no active exact winner');
     }
 
-    await setRequestCleanupVectorIds(db, request.user_id, hash, claim.leaseToken, [id]);
-    await deleteVector(env.VECTORIZE, id);
-    await setRequestCleanupVectorIds(db, request.user_id, hash, claim.leaseToken, null);
+    await cleanupCandidateVector(db, env, request.user_id, hash, claim.leaseToken, id);
     responses.push(toResponse(winner));
   }
 
   return responses;
+}
+
+async function cleanupCandidateVector(
+  db: ReturnType<typeof createDb>,
+  env: Env,
+  userId: string,
+  hash: string,
+  leaseToken: number,
+  id: string,
+): Promise<void> {
+  await setRequestCleanupVectorIds(db, userId, hash, leaseToken, [id]);
+  await deleteVector(env.VECTORIZE, id);
+  await setRequestCleanupVectorIds(db, userId, hash, leaseToken, null);
 }
 
 async function cleanupPendingRequestVectors(
@@ -749,16 +765,41 @@ export async function updateMemory(env: Env, id: string, userId: string, request
     updatedAt: now,
   };
 
+  try {
+    await db.update(memories).set({
+      content,
+      contentHash: next.contentHash,
+      metadataJson: next.metadataJson,
+      updatedAt: now,
+    }).where(eq(memories.id, id)).run();
+  } catch (error) {
+    if (content !== current.content && isMemoryContentUniqueConstraintError(error)) {
+      throw new MemoryContentConflictError();
+    }
+    throw error;
+  }
+
   const vector = await embedText(env, content);
   await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: await memoryVectorMetadata(next) }]);
-  await db.update(memories).set({
-    content,
-    contentHash: next.contentHash,
-    metadataJson: next.metadataJson,
-    updatedAt: now,
-  }).where(eq(memories.id, id)).run();
   await appendHistory(db, next, 'updated');
   return toResponse(next);
+}
+
+function isMemoryContentUniqueConstraintError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (typeof current === 'object' && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const candidate = current as { message?: unknown; cause?: unknown };
+    if (typeof candidate.message === 'string'
+      && /unique constraint failed/i.test(candidate.message)
+      && /memories/i.test(candidate.message)
+      && /content_hash/i.test(candidate.message)) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
 }
 
 export async function deleteMemory(env: Env, id: string, userId: string): Promise<boolean> {

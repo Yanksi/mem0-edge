@@ -2,7 +2,14 @@ import { Hono } from 'hono';
 import { z, ZodError } from 'zod';
 import { apiAuth } from '../auth';
 import type { Env } from '../env';
-import { addMemory, deleteMemory, getMemoryById, searchMemories, updateMemory } from '../memory/service';
+import {
+  addMemory,
+  deleteMemory,
+  getMemoryById,
+  MemoryContentConflictError,
+  searchMemories,
+  updateMemory,
+} from '../memory/service';
 import { AddMemoryRequestSchema, HermesSearchRequestSchema } from '../memory/types';
 import type { HermesSearchRequest, SearchMemoryRequest } from '../memory/types';
 const HermesUpdateRequestSchema = z.object({ text: z.string().trim().min(1) });
@@ -34,8 +41,15 @@ hermesRoutes.put('/memories/:id', async (context) => {
   const memory = await getMemoryById(context.env, context.req.param('id'));
   if (memory === null) return notFound(context);
   if (memory.user_id === undefined) return context.json({ error: 'Memory is not user-scoped' }, 409);
-  const updated = await updateMemory(context.env, memory.id, memory.user_id, { memory: request.text });
-  return updated === null ? notFound(context) : context.json(updated);
+  try {
+    const updated = await updateMemory(context.env, memory.id, memory.user_id, { memory: request.text });
+    return updated === null ? notFound(context) : context.json(updated);
+  } catch (error) {
+    if (error instanceof MemoryContentConflictError) {
+      return context.json({ error: 'An active memory with this content already exists' }, 409);
+    }
+    throw error;
+  }
 });
 
 hermesRoutes.delete('/memories/:id', async (context) => {

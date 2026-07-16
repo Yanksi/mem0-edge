@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
-import { entities, memories, memoryEntityLinks, memoryRequests, relationships } from '../src/db/schema';
+import { entities, memories, memoryEntityLinks, memoryHistory, memoryRequests, relationships } from '../src/db/schema';
 import { sha256Hex } from '../src/memory/idempotency';
 
 const dependencies = vi.hoisted(() => ({
@@ -136,6 +136,7 @@ function createMemoryWriteDb(options: {
   retryRows?: Array<Record<string, unknown>>;
   memoryInsertResults?: Array<Record<string, unknown> | undefined>;
   memoryGetRows?: Array<Record<string, unknown> | undefined>;
+  cleanupUpdateRows?: Array<Array<Record<string, unknown>>>;
 } = {}) {
   const requestClaim = vi.fn().mockResolvedValue(options.claimRows ?? [{ idempotencyKey: 'request-123' }]);
   const getLedger = vi.fn().mockResolvedValue(options.ledgerRow);
@@ -147,16 +148,22 @@ function createMemoryWriteDb(options: {
   memoryGet.mockResolvedValue(undefined);
   const insertValues: Array<{ table: unknown; values: Record<string, unknown> }> = [];
   const requestUpdates: Array<Record<string, unknown>> = [];
+  const cleanupUpdateRows = [...(options.cleanupUpdateRows ?? [])];
   const requestSet = vi.fn((values: Record<string, unknown>) => {
     requestUpdates.push(values);
     const retryTransition = 'leaseToken' in values && (values.status === 'processing' || values.status === 'queued');
+    const cleanupTransition = 'cleanupVectorIdsJson' in values;
     return {
       where: vi.fn().mockReturnValue({
         run: vi.fn().mockResolvedValue({}),
         returning: vi.fn().mockReturnValue({
-          all: vi.fn().mockResolvedValue(retryTransition
-            ? (options.retryRows ?? [{ leaseToken: 2, candidatesJson: null, cleanupVectorIdsJson: null }])
-            : [{ leaseToken: 1 }]),
+          all: vi.fn().mockResolvedValue(
+            retryTransition
+              ? (options.retryRows ?? [{ leaseToken: 2, candidatesJson: null, cleanupVectorIdsJson: null }])
+              : cleanupTransition && cleanupUpdateRows.length > 0
+                ? cleanupUpdateRows.shift()
+                : [{ leaseToken: 1 }],
+          ),
         }),
       }),
     };
@@ -504,7 +511,7 @@ describe('addMemory idempotency ledger', () => {
 
   it('returns an existing exact duplicate without embedding or write side effects', async () => {
     const canonical = { ...memoryRow('canonical', 'Existing fact'), contentHash: 'exact-digest' };
-    const { db, insertValues } = createMemoryWriteDb();
+    const { db, insertValues, requestUpdates } = createMemoryWriteDb();
     dependencies.createDb.mockReturnValue(db);
     dependencies.prepareMemoryWrite.mockResolvedValue({
       contentHash: 'exact-digest',
@@ -519,6 +526,8 @@ describe('addMemory idempotency ledger', () => {
 
     expect(dependencies.embedText).not.toHaveBeenCalled();
     expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    expect(requestUpdates.some(({ cleanupVectorIdsJson }) => cleanupVectorIdsJson !== undefined)).toBe(false);
     expect(insertValues.some(({ table }) => table === memories)).toBe(false);
     expect(insertValues.some(({ table }) => table !== memoryRequests)).toBe(false);
   });
@@ -774,6 +783,111 @@ describe('addMemory idempotency ledger', () => {
     expect(insertValues.some(({ table }) => table === memoryEntityLinks)).toBe(true);
     expect(insertValues.some(({ table }) => table === relationships)).toBe(true);
   });
+
+  it('repairs its deterministic row when retry pre-read misses and preparation finds it', async () => {
+    const candidatesJson = JSON.stringify([{
+      memory: 'Ada works at Acme.',
+      entities: [{ name: 'Ada', type: 'person' }, { name: 'Acme', type: 'company' }],
+      relationships: [{ source: 'Ada', target: 'Acme', relation_type: 'works_at' }],
+    }]);
+    const ownId = await sha256Hex('memory:user-123:request-123:0');
+    const own = memoryRow(ownId, 'Ada works at Acme.');
+    const { db, insertValues } = createMemoryWriteDb({
+      claimRows: [],
+      ledgerRow: { status: 'failed', candidatesJson, cleanupVectorIdsJson: null },
+      retryRows: [{ leaseToken: 2, candidatesJson, cleanupVectorIdsJson: null }],
+      memoryGetRows: [undefined],
+    });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: own.contentHash!, exactScopeKey: 'scope-key', duplicate: own,
+    });
+    dependencies.embedText.mockResolvedValue([0.2, 0.3]);
+    dependencies.upsertEntityVectors.mockResolvedValue(undefined);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    const result = await actual.addMemory(env, { ...addRequest, messages: [{ role: 'user', content: own.content }] });
+
+    expect(result).toEqual([expect.objectContaining({ id: ownId })]);
+    expect(dependencies.prepareMemoryWrite).toHaveBeenCalledOnce();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    expect(insertValues.some(({ table }) => table === memoryHistory)).toBe(true);
+    expect(insertValues.some(({ table }) => table === entities)).toBe(true);
+    expect(insertValues.some(({ table }) => table === memoryEntityLinks)).toBe(true);
+    expect(insertValues.some(({ table }) => table === relationships)).toBe(true);
+  });
+
+  it('cleans a previously published candidate vector when retry preparation finds another canonical row', async () => {
+    const candidatesJson = JSON.stringify([{ memory: 'Direct fact', entities: [], relationships: [] }]);
+    const candidateId = await sha256Hex('memory:user-123:request-123:0');
+    const canonical = memoryRow('canonical-winner', 'Direct fact');
+    const { db, requestSet, requestUpdates } = createMemoryWriteDb({
+      claimRows: [],
+      ledgerRow: { status: 'failed', candidatesJson, cleanupVectorIdsJson: null },
+      retryRows: [{ leaseToken: 2, candidatesJson, cleanupVectorIdsJson: null }],
+      memoryGetRows: [undefined],
+    });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: canonical.contentHash!, exactScopeKey: 'scope-key', duplicate: canonical,
+    });
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await expect(actual.addMemory(env, {
+      ...addRequest, infer: false, messages: [{ role: 'user', content: canonical.content }],
+    })).resolves.toEqual([expect.objectContaining({ id: canonical.id })]);
+
+    expect(requestUpdates).toContainEqual(expect.objectContaining({
+      cleanupVectorIdsJson: JSON.stringify([candidateId]),
+    }));
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(env.VECTORIZE, candidateId);
+    expect(dependencies.deleteVector).not.toHaveBeenCalledWith(env.VECTORIZE, canonical.id);
+    expect(requestUpdates).toContainEqual(expect.objectContaining({ cleanupVectorIdsJson: null }));
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    const markerCall = requestSet.mock.calls.findIndex(([values]) => (
+      values.cleanupVectorIdsJson === JSON.stringify([candidateId])
+    ));
+    const clearCall = requestSet.mock.calls.findIndex(([values]) => values.cleanupVectorIdsJson === null);
+    const completeCall = requestSet.mock.calls.findIndex(([values]) => values.status === 'completed');
+    expect(requestSet.mock.invocationCallOrder[markerCall]).toBeLessThan(
+      dependencies.deleteVector.mock.invocationCallOrder[0],
+    );
+    expect(dependencies.deleteVector.mock.invocationCallOrder[0]).toBeLessThan(
+      requestSet.mock.invocationCallOrder[clearCall],
+    );
+    expect(requestSet.mock.invocationCallOrder[clearCall]).toBeLessThan(
+      requestSet.mock.invocationCallOrder[completeCall],
+    );
+  });
+
+  it('does not delete the candidate after a D1-conflict crash when cleanup marker lease is replaced', async () => {
+    const candidatesJson = JSON.stringify([{ memory: 'Direct fact', entities: [], relationships: [] }]);
+    const candidateId = await sha256Hex('memory:user-123:request-123:0');
+    const canonical = memoryRow('canonical-winner', 'Direct fact');
+    const { db, requestUpdates } = createMemoryWriteDb({
+      claimRows: [],
+      ledgerRow: { status: 'failed', candidatesJson, cleanupVectorIdsJson: null },
+      retryRows: [{ leaseToken: 2, candidatesJson, cleanupVectorIdsJson: null }],
+      memoryGetRows: [undefined],
+      cleanupUpdateRows: [[]],
+    });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.prepareMemoryWrite.mockResolvedValue({
+      contentHash: canonical.contentHash!, exactScopeKey: 'scope-key', duplicate: canonical,
+    });
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await expect(actual.addMemory(env, {
+      ...addRequest, infer: false, messages: [{ role: 'user', content: canonical.content }],
+    })).rejects.toBeInstanceOf(actual.TransientMemoryJobError);
+
+    expect(requestUpdates).toContainEqual(expect.objectContaining({
+      cleanupVectorIdsJson: JSON.stringify([candidateId]),
+    }));
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+    expect(requestUpdates.filter(({ cleanupVectorIdsJson }) => cleanupVectorIdsJson === null)).toEqual([]);
+  });
 });
 
 function memoryRow(id: string, content: string): typeof memories.$inferSelect {
@@ -793,17 +907,30 @@ function memoryRow(id: string, content: string): typeof memories.$inferSelect {
   };
 }
 
-function createUpdateDb(current: typeof memories.$inferSelect) {
+function createUpdateDb(
+  current: typeof memories.$inferSelect,
+  options: { updateErrors?: Error[] } = {},
+) {
+  let stored = current;
+  const updateErrors = [...(options.updateErrors ?? [])];
   const updateValues: Array<Record<string, unknown>> = [];
   const historyValues: Array<Record<string, unknown>> = [];
+  let pendingUpdate: Record<string, unknown> | undefined;
+  const updateRun = vi.fn(async () => {
+    const error = updateErrors.shift();
+    if (error !== undefined) throw error;
+    stored = { ...stored, ...pendingUpdate };
+    return {};
+  });
   const db = {
     select: vi.fn(() => ({
-      from: vi.fn(() => ({ where: vi.fn().mockReturnValue({ get: vi.fn().mockResolvedValue(current) }) })),
+      from: vi.fn(() => ({ where: vi.fn().mockReturnValue({ get: vi.fn().mockImplementation(async () => stored) }) })),
     })),
     update: vi.fn(() => ({
       set: vi.fn((values: Record<string, unknown>) => {
         updateValues.push(values);
-        return { where: vi.fn().mockReturnValue({ run: vi.fn().mockResolvedValue({}) }) };
+        pendingUpdate = values;
+        return { where: vi.fn().mockReturnValue({ run: updateRun }) };
       }),
     })),
     insert: vi.fn(() => ({
@@ -813,7 +940,7 @@ function createUpdateDb(current: typeof memories.$inferSelect) {
       }),
     })),
   };
-  return { db, updateValues, historyValues };
+  return { db, updateRun, updateValues, historyValues };
 }
 
 describe('updateMemory deduplication', () => {
@@ -878,6 +1005,53 @@ describe('updateMemory deduplication', () => {
     expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [expect.objectContaining({
       metadata: expect.objectContaining({ scope_key: expect.any(String), priority: 2 }),
     })]);
+  });
+
+  it('maps a concurrent D1 content uniqueness race before losing vector mutation', async () => {
+    const current = { ...memoryRow('memory-to-update', 'Old content'), agentId: 'agent-123' };
+    const uniqueError = new Error(
+      'D1_ERROR: UNIQUE constraint failed: memories.user_id, memories.agent_id, memories.content_hash',
+    );
+    const { db, updateRun, historyValues } = createUpdateDb(current, { updateErrors: [uniqueError] });
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.findActiveExactMemory.mockResolvedValue(undefined);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await expect(actual.updateMemory(env, current.id, 'user-123', { memory: 'Raced content' }))
+      .rejects.toBeInstanceOf(actual.MemoryContentConflictError);
+
+    expect(updateRun).toHaveBeenCalledOnce();
+    expect(dependencies.embedText).not.toHaveBeenCalled();
+    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
+    expect(historyValues).toEqual([]);
+  });
+
+  it('repairs Vectorize on retry after D1 content update succeeded first', async () => {
+    const current = { ...memoryRow('memory-to-update', 'Old content'), agentId: 'agent-123' };
+    const { db, updateRun, updateValues, historyValues } = createUpdateDb(current);
+    dependencies.createDb.mockReturnValue(db);
+    dependencies.upsertVectors
+      .mockRejectedValueOnce(new Error('vector unavailable after D1 update'))
+      .mockResolvedValueOnce(undefined);
+    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
+
+    await expect(actual.updateMemory(env, current.id, 'user-123', {
+      memory: 'Durably updated content', metadata: { source: 'api' },
+    })).rejects.toThrow('vector unavailable after D1 update');
+    await expect(actual.updateMemory(env, current.id, 'user-123', {
+      memory: 'Durably updated content', metadata: { source: 'api' },
+    })).resolves.toEqual(expect.objectContaining({ memory: 'Durably updated content' }));
+
+    expect(dependencies.findActiveExactMemory).toHaveBeenCalledOnce();
+    expect(updateRun).toHaveBeenCalledTimes(2);
+    expect(dependencies.upsertVectors).toHaveBeenCalledTimes(2);
+    expect(updateRun.mock.invocationCallOrder[0]).toBeLessThan(dependencies.upsertVectors.mock.invocationCallOrder[0]);
+    expect(updateRun.mock.invocationCallOrder[1]).toBeLessThan(dependencies.upsertVectors.mock.invocationCallOrder[1]);
+    expect(updateValues[1]).toEqual(expect.objectContaining({
+      content: 'Durably updated content',
+      contentHash: updateValues[0].contentHash,
+    }));
+    expect(historyValues).toHaveLength(1);
   });
 });
 
@@ -1220,6 +1394,42 @@ describe('Hermes self-hosted compatibility routes', () => {
     });
     expect(service.deleteMemory).toHaveBeenCalledWith(env, 'memory-123', 'user-123');
   });
+
+  it.each(['/memories/memory-123', '/v1/memories/memory-123'])(
+    'returns the memory content conflict response for Hermes PUT %s',
+    async (path) => {
+      service.getMemoryById.mockResolvedValue(memory);
+      service.updateMemory.mockRejectedValue(new service.MemoryContentConflictError('duplicate'));
+
+      const response = await worker.fetch(request(path, {
+        method: 'PUT',
+        headers: { 'X-API-Key': 'test-api-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: 'Existing content' }),
+      }), env);
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({
+        error: 'An active memory with this content already exists',
+      });
+    },
+  );
+
+  it.each(['/memories/memory-123', '/v1/memories/memory-123'])(
+    'propagates unrelated Hermes PUT errors for %s',
+    async (path) => {
+      service.getMemoryById.mockResolvedValue(memory);
+      service.updateMemory.mockRejectedValue(new Error('database unavailable'));
+
+      const response = await worker.fetch(request(path, {
+        method: 'PUT',
+        headers: { 'X-API-Key': 'test-api-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: 'New content' }),
+      }), env);
+
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toEqual({ error: 'Internal server error' });
+    },
+  );
 
   it('accepts Hermes search requests at /v1/search and keeps identity filters out of metadata filters', async () => {
     service.searchMemories.mockResolvedValue([{ ...memory, score: 0.98 }]);
