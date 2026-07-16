@@ -16,9 +16,23 @@ const dedupDefaults = {
   DEDUP_CANDIDATE_LIMIT: '8',
 };
 
-function variableValue(source: string, name: string): string | undefined {
-  const match = source.match(new RegExp(`^${name}\\s*=\\s*"([^"]*)"$`, 'm'));
-  return match?.[1];
+function parseVars(source: string): Record<string, string> {
+  const header = source.search(/^\[vars\]\s*$/m);
+  if (header < 0) throw new Error('Wrangler configuration does not contain [vars]');
+
+  const bodyStart = source.indexOf('\n', header) + 1;
+  const remainder = source.slice(bodyStart);
+  const nextHeader = remainder.search(/^\s*\[/m);
+  const body = nextHeader < 0 ? remainder : remainder.slice(0, nextHeader);
+
+  return Object.fromEntries(body
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== '' && !line.trimStart().startsWith('#'))
+    .map((line) => {
+      const match = line.match(/^([A-Z][A-Z0-9_]*)\s*=\s*"([^"]*)"\s*(?:#.*)?$/);
+      if (match === null) throw new Error(`Unsupported Wrangler variable: ${line}`);
+      return [match[1], match[2]];
+    }));
 }
 
 describe.each([
@@ -26,13 +40,29 @@ describe.each([
   ['remote preview', remotePreviewConfig],
 ])('%s Wrangler configuration', (_name, config) => {
   it('declares the semantic deduplication plaintext defaults', () => {
+    const variables = parseVars(config);
+
+    expect(Object.keys(variables).filter((name) => name.startsWith('DEDUP_')).sort()).toEqual(
+      Object.keys(dedupDefaults).sort(),
+    );
     for (const [name, value] of Object.entries(dedupDefaults)) {
-      expect(variableValue(config, name), name).toBe(value);
+      expect(variables[name], name).toBe(value);
     }
   });
 
-  it('does not declare the semantic deduplication secret', () => {
-    expect(config).not.toMatch(/^DEDUP_LLM_API_KEY\s*=/m);
+  it('does not declare any API key secret in plaintext vars', () => {
+    const variableNames = Object.keys(parseVars(config));
+
+    expect(variableNames.filter((name) => name.endsWith('_API_KEY'))).toEqual([]);
+    for (const secretName of [
+      'LLM_API_KEY',
+      'EMBEDDING_API_KEY',
+      'GRAPH_LLM_API_KEY',
+      'DEDUP_LLM_API_KEY',
+      'OPENAI_API_KEY',
+    ]) {
+      expect(variableNames).not.toContain(secretName);
+    }
   });
 });
 
@@ -56,6 +86,25 @@ describe('local secret template', () => {
 });
 
 describe('semantic deduplication documentation', () => {
+  it('describes the guided deployment flow without promising resource provisioning', () => {
+    expect(readme).toContain("The Deploy button opens Cloudflare's guided deployment and fork flow.");
+    expect(readme).toContain('Operators must still create or select the required D1, Vectorize, Queue, and DLQ resources');
+    expect(readme).not.toContain("Cloudflare's deploy button provisions the declared D1, Vectorize, and Queue bindings");
+  });
+
+  it('describes the checked-in D1 binding without treating it as a placeholder', () => {
+    expect(readme).toContain('contains the current deployment\'s concrete D1 binding as a reference configuration');
+    expect(readme).toContain('ensure `database_id` points to a D1 database in their own Cloudflare account');
+    expect(readme).toContain('keep the valid checked-in binding when it already names the intended database');
+    expect(readme).not.toMatch(/all-zero D1/i);
+  });
+
+  it('documents both supported API-key headers for protected routes', () => {
+    expect(readme).toContain('Protected memory and graph routes accept either `Authorization: Bearer <MEM0_API_KEY>` or `X-API-Key: <MEM0_API_KEY>`.');
+    expect(readme).toContain('The `/health` endpoint is public.');
+    expect(readme).not.toContain('All `/v1/*` routes require');
+  });
+
   it('keeps repository and write-time behavior accurate', () => {
     expect(readme).toContain('https://github.com/Yanksi/mem-worker');
     expect(readme).toContain('Exact write-time deduplication is always enabled.');

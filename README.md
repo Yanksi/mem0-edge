@@ -6,7 +6,7 @@ This is **not** the full Python Mem0 implementation. It deliberately uses D1 for
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Yanksi/mem-worker)
 
-Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflare's deploy button provisions the declared D1, Vectorize, and Queue bindings, and prompts for secrets from `.dev.vars.example`. Create the Vectorize metadata indexes listed below after deployment.
+Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deploy button opens Cloudflare's guided deployment and fork flow. Operators must still create or select the required D1, Vectorize, Queue, and DLQ resources, wire their bindings to the Worker, create the metadata indexes listed below, and set the required secrets.
 
 ## Included
 
@@ -41,7 +41,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). Cloudflar
 - **Queues** receives asynchronous extraction-and-store jobs. Import work is backed by a canonical D1 ledger, bounded to one message per batch and two concurrent consumers, retried with delay on transient Vectorize failures, and exhausted deliveries are retained in a DLQ.
 - **OpenAI-compatible endpoints** are used for embeddings, extraction, graph reflection, and semantic deduplication. Each model path has its own endpoint, model, and credential.
 
-All `/v1/*` routes require `Authorization: Bearer $MEM0_API_KEY`. The dashboard has its own password login.
+Protected memory and graph routes accept either `Authorization: Bearer <MEM0_API_KEY>` or `X-API-Key: <MEM0_API_KEY>`. The `/health` endpoint is public. The dashboard has its own password login.
 
 ### Model and endpoint defaults
 
@@ -330,13 +330,15 @@ npm run typecheck
 
 ## Provision Cloudflare resources
 
-`wrangler.toml` is intentionally checked in with an all-zero D1 `database_id`. Replace it before deploying.
+`wrangler.toml` contains the current deployment's concrete D1 binding as a reference configuration. Forks and other operators must ensure `database_id` points to a D1 database in their own Cloudflare account, replacing the checked-in value only when their deployment flow does not do so. Existing operators should keep the valid checked-in binding when it already names the intended database.
 
-1. Create D1 and copy the reported `database_id` into `wrangler.toml`:
+1. Verify the D1 binding. If the deployment does not already have its own database, create one:
 
    ```sh
    npx wrangler d1 create mem0-edge
    ```
+
+   Copy the reported `database_id` into the deployment configuration only when the deployment or fork flow has not already wired the intended D1 database.
 
 2. Create the Vectorize index with the dimensions and metric expected by the configured embedding model:
 
@@ -418,7 +420,7 @@ The package script reads `.env` when it exists; the direct form shown above requ
 
 ## Manual deployment
 
-After provisioning, setting secrets, and replacing the all-zero D1 ID:
+After provisioning, setting secrets, and verifying that every resource binding targets the intended Cloudflare resources:
 
 ```sh
 npm run deploy
