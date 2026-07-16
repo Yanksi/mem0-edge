@@ -170,6 +170,7 @@ export const mem0ImportRequests = sqliteTable(
     updatedAt,
     completedAt: integer('completed_at'),
     cleanupVectorId: text('cleanup_vector_id'),
+    cleanupVectorGeneration: integer('cleanup_vector_generation').notNull().default(0),
   },
   (table) => [
     index('mem0_import_requests_status_updated_at_idx').on(table.status, table.updatedAt),

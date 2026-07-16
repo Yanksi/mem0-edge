@@ -40,7 +40,13 @@ interface ImportRequestRow {
   attempt_count: number;
   lease_token: number;
   cleanup_vector_id: string | null;
+  cleanup_vector_generation: number;
   error_message: string | null;
+}
+
+interface ImportVectorCleanupIntent {
+  vectorId: string;
+  generation: number;
 }
 
 interface ImportMemoryRow {
@@ -57,7 +63,7 @@ const TERMINAL_IMPORT_CONFLICT_PREFIX = 'Terminal Mem0 import conflict:';
 const IMPORT_PROCESSING_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_LEASE_SECONDS = 5 * 60;
 const IMPORT_DISPATCH_BATCH_SIZE = 100;
-const IMPORT_LEDGER_COLUMNS = 'request_id, entity_type, entity_id, item_json, status, attempt_count, lease_token, cleanup_vector_id, error_message';
+const IMPORT_LEDGER_COLUMNS = 'request_id, entity_type, entity_id, item_json, status, attempt_count, lease_token, cleanup_vector_id, cleanup_vector_generation, error_message';
 
 export function isMem0ImportJob(value: unknown): value is Mem0ImportJob {
   if (typeof value !== 'object' || value === null) return false;
@@ -203,9 +209,9 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
         throw new TransientMem0ImportError('Mem0 import deterministic row disappeared during preparation');
       }
       if (claim.attempt_count > 1 && cleanedPendingVectorId !== claim.request_id) {
-        await cleanupImportVector(env, claim, claim.request_id);
+        await cleanupUnmarkedImportVector(env, claim, claim.request_id);
       }
-      return await completeImportLease(env, claim, now);
+      return await completeDuplicateImportLease(env, claim, now);
     }
 
     const row = {
@@ -229,10 +235,10 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
         now,
       );
     }
-    await setImportCleanupVectorId(env, claim, claim.request_id);
+    const vectorIntent = await armImportVectorCleanup(env, claim, claim.request_id);
     await upsertVectors(env.VECTORIZE, [{ id: claim.request_id, values: embedding, metadata: await memoryVectorMetadata(row) }]);
-    if (!await hasActiveImportVectorIntent(env, claim)) {
-      await reconcileLostImportVector(env, claim);
+    if (!await hasActiveImportVectorIntent(env, claim, vectorIntent)) {
+      await reconcileLostImportVector(env, claim, vectorIntent);
       return 'inflight';
     }
 
@@ -259,11 +265,11 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
       claim.lease_token,
     ).run();
     if (Number(inserted.meta.changes ?? 0) === 1) {
-      await setImportCleanupVectorId(env, claim, null);
+      await clearImportCleanupForCanonical(env, claim);
       return await completeDeterministicImportLease(env, claim, item, metadataJson, createdAt, now);
     }
-    if (!await hasActiveImportVectorIntent(env, claim)) {
-      await reconcileLostImportVector(env, claim);
+    if (!await hasActiveImportVectorIntent(env, claim, vectorIntent)) {
+      await reconcileLostImportVector(env, claim, vectorIntent);
       return 'inflight';
     }
 
@@ -292,8 +298,8 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
       throw new TransientMem0ImportError('Mem0 import insert conflict has no active exact winner');
     }
 
-    await cleanupImportVector(env, claim, claim.request_id);
-    return await completeImportLease(env, claim, now);
+    await cleanupImportVector(env, claim, vectorIntent);
+    return await completeDuplicateImportLease(env, claim, now);
   } catch (error) {
     await failImportRequest(env, claim.request_id, claim.lease_token, error);
     throw error;
@@ -302,38 +308,129 @@ export async function processMem0ImportJob(env: Env, job: Mem0ImportJob): Promis
 
 async function cleanupPendingImportVector(env: Env, claim: ImportRequestRow): Promise<string | undefined> {
   if (claim.cleanup_vector_id === null) return undefined;
-  await cleanupImportVector(env, claim, claim.cleanup_vector_id);
+  await cleanupImportVector(env, claim, {
+    vectorId: claim.cleanup_vector_id,
+    generation: claim.cleanup_vector_generation,
+  });
   return claim.cleanup_vector_id;
 }
 
-async function cleanupImportVector(env: Env, claim: ImportRequestRow, vectorId: string): Promise<void> {
-  await setImportCleanupVectorId(env, claim, vectorId);
-  await deleteVector(env.VECTORIZE, vectorId);
-  await setImportCleanupVectorId(env, claim, null);
-}
-
-async function setImportCleanupVectorId(
+async function cleanupUnmarkedImportVector(
   env: Env,
   claim: ImportRequestRow,
-  vectorId: string | null,
+  vectorId: string,
 ): Promise<void> {
+  const intent = await armImportVectorCleanup(env, claim, vectorId);
+  await cleanupImportVector(env, claim, intent);
+}
+
+async function cleanupCurrentImportVector(env: Env, claim: ImportRequestRow): Promise<void> {
+  const intent = await findActiveImportCleanupIntent(env, claim)
+    ?? await armImportVectorCleanup(env, claim, claim.request_id);
+  await cleanupImportVector(env, claim, intent);
+}
+
+async function armImportVectorCleanup(
+  env: Env,
+  claim: ImportRequestRow,
+  vectorId: string,
+): Promise<ImportVectorCleanupIntent> {
+  const armed = await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET cleanup_vector_id = ?, cleanup_vector_generation = cleanup_vector_generation + 1,
+        updated_at = unixepoch()
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      AND cleanup_vector_id IS NULL
+    RETURNING cleanup_vector_generation
+  `).bind(vectorId, claim.request_id, claim.lease_token)
+    .first<{ cleanup_vector_generation: number }>();
+  if (armed === null) {
+    throw new TransientMem0ImportError('Mem0 import cleanup became pending before vector mutation');
+  }
+  return { vectorId, generation: armed.cleanup_vector_generation };
+}
+
+async function cleanupImportVector(
+  env: Env,
+  claim: ImportRequestRow,
+  intent: ImportVectorCleanupIntent,
+): Promise<void> {
+  const occupied = await findImportMemoryById(env, intent.vectorId);
+  if (occupied?.deleted_at === null) {
+    await clearImportCleanupForCanonical(env, claim);
+    return;
+  }
+
+  await deleteVector(env.VECTORIZE, intent.vectorId);
+  await clearImportCleanupIntent(env, claim, intent);
+}
+
+async function clearImportCleanupIntent(
+  env: Env,
+  claim: ImportRequestRow,
+  intent: ImportVectorCleanupIntent,
+): Promise<boolean> {
   const result = await env.DB.prepare(`
     UPDATE mem0_import_requests
-    SET cleanup_vector_id = ?, updated_at = unixepoch()
+    SET cleanup_vector_id = NULL, updated_at = unixepoch()
     WHERE request_id = ? AND status = 'processing' AND lease_token = ?
-  `).bind(vectorId, claim.request_id, claim.lease_token).run();
+      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
+  `).bind(
+    claim.request_id,
+    claim.lease_token,
+    intent.vectorId,
+    intent.generation,
+  ).run();
+  return Number(result.meta.changes ?? 0) === 1;
+}
+
+async function clearImportCleanupForCanonical(env: Env, claim: ImportRequestRow): Promise<void> {
+  const result = await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET cleanup_vector_id = NULL, updated_at = unixepoch()
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL)
+  `).bind(claim.request_id, claim.lease_token, claim.request_id).run();
   if (Number(result.meta.changes ?? 0) !== 1) {
-    throw new Error('Mem0 import lease was replaced during vector cleanup');
+    throw new Error('Mem0 import lease was replaced while preserving its canonical vector');
   }
 }
 
-async function hasActiveImportVectorIntent(env: Env, claim: ImportRequestRow): Promise<boolean> {
+async function findActiveImportCleanupIntent(
+  env: Env,
+  claim: ImportRequestRow,
+): Promise<ImportVectorCleanupIntent | undefined> {
+  const pending = await env.DB.prepare(`
+    SELECT cleanup_vector_id, cleanup_vector_generation
+    FROM mem0_import_requests
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      AND cleanup_vector_id IS NOT NULL
+  `).bind(claim.request_id, claim.lease_token).first<{
+    cleanup_vector_id: string;
+    cleanup_vector_generation: number;
+  }>();
+  return pending === null ? undefined : {
+    vectorId: pending.cleanup_vector_id,
+    generation: pending.cleanup_vector_generation,
+  };
+}
+
+async function hasActiveImportVectorIntent(
+  env: Env,
+  claim: ImportRequestRow,
+  intent: ImportVectorCleanupIntent,
+): Promise<boolean> {
   const active = await env.DB.prepare(`
     SELECT request_id
     FROM mem0_import_requests
     WHERE request_id = ? AND status = 'processing' AND lease_token = ?
-      AND cleanup_vector_id = ?
-  `).bind(claim.request_id, claim.lease_token, claim.request_id).first<{ request_id: string }>();
+      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
+  `).bind(
+    claim.request_id,
+    claim.lease_token,
+    intent.vectorId,
+    intent.generation,
+  ).first<{ request_id: string }>();
   return active !== null;
 }
 
@@ -356,12 +453,12 @@ async function resolveDeterministicImportRow(
   now: number,
 ): Promise<ProcessMem0ImportResult> {
   if (row.deleted_at !== null) {
-    await cleanupImportVector(env, claim, claim.request_id);
+    await cleanupCurrentImportVector(env, claim);
     throw new TerminalMem0ImportConflictError('deterministic memory ID is occupied by a soft-deleted row');
   }
 
   const conflict = deterministicImportRowConflict(row, scope, item.memory, expectedContentHash);
-  await setImportCleanupVectorId(env, claim, null);
+  await clearImportCleanupForCanonical(env, claim);
   if (conflict !== undefined) throw new TerminalMem0ImportConflictError(conflict);
 
   return completeDeterministicImportLease(
@@ -407,41 +504,102 @@ async function prepareImportMemoryWrite(
   }
 }
 
-async function reconcileLostImportVector(env: Env, claim: ImportRequestRow): Promise<void> {
+async function reconcileLostImportVector(
+  env: Env,
+  claim: ImportRequestRow,
+  intent: ImportVectorCleanupIntent,
+): Promise<void> {
   const occupied = await findImportMemoryById(env, claim.request_id);
   if (occupied?.deleted_at === null) return;
 
-  const current = await findImportRequest(env, claim.request_id);
-  if (current?.status === 'processing') return;
+  const rearmed = await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET cleanup_vector_id = ?,
+        cleanup_vector_generation = cleanup_vector_generation + 1,
+        updated_at = unixepoch()
+    WHERE request_id = ?
+      AND status IN ('processing', 'completed', 'failed')
+      AND cleanup_vector_generation >= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL
+      )
+    RETURNING ${IMPORT_LEDGER_COLUMNS}
+  `).bind(
+    intent.vectorId,
+    claim.request_id,
+    intent.generation,
+    claim.request_id,
+  ).first<ImportRequestRow>();
+
+  if (rearmed === null) {
+    const canonical = await findImportMemoryById(env, claim.request_id);
+    if (canonical?.deleted_at === null) return;
+    const current = await findImportRequest(env, claim.request_id);
+    if (current?.cleanup_vector_id !== null) return;
+    throw new TransientMem0ImportError('Mem0 import could not persist stale vector cleanup intent');
+  }
+
+  if (rearmed.status === 'processing' || rearmed.status === 'failed') return;
+
+  const canonical = await findImportMemoryById(env, claim.request_id);
+  if (canonical?.deleted_at === null) return;
+
+  const rearmedIntent = {
+    vectorId: intent.vectorId,
+    generation: rearmed.cleanup_vector_generation,
+  };
 
   try {
-    await deleteVector(env.VECTORIZE, claim.request_id);
+    await deleteVector(env.VECTORIZE, intent.vectorId);
   } catch (error) {
-    if (current !== null) await preserveLostImportCleanup(env, current, claim.request_id, error);
+    await preserveLostImportCleanup(env, rearmed, rearmedIntent, error);
     throw new TransientMem0ImportError(
       `Mem0 import stale vector cleanup failed: ${safeImportErrorDetail(env, error)}`,
       { cause: error },
     );
   }
+
+  await clearRearmedImportCleanup(env, rearmed, rearmedIntent);
 }
 
 async function preserveLostImportCleanup(
   env: Env,
   current: ImportRequestRow,
-  vectorId: string,
+  intent: ImportVectorCleanupIntent,
   error: unknown,
 ): Promise<void> {
   await env.DB.prepare(`
     UPDATE mem0_import_requests
-    SET status = 'failed', cleanup_vector_id = ?, error_message = ?,
+    SET status = 'failed', error_message = ?,
         updated_at = unixepoch(), completed_at = NULL
     WHERE request_id = ? AND status = ? AND lease_token = ?
+      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
   `).bind(
-    vectorId,
     `Mem0 import stale vector cleanup failed: ${safeImportErrorDetail(env, error)}`,
     current.request_id,
     current.status,
     current.lease_token,
+    intent.vectorId,
+    intent.generation,
+  ).run();
+}
+
+async function clearRearmedImportCleanup(
+  env: Env,
+  current: ImportRequestRow,
+  intent: ImportVectorCleanupIntent,
+): Promise<void> {
+  await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET cleanup_vector_id = NULL, updated_at = unixepoch()
+    WHERE request_id = ? AND status = ? AND lease_token = ?
+      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
+  `).bind(
+    current.request_id,
+    current.status,
+    current.lease_token,
+    intent.vectorId,
+    intent.generation,
   ).run();
 }
 
@@ -477,6 +635,7 @@ async function completeDeterministicImportLease(
       SELECT ?, ?, 'ADD', ?, ?, ?, ?
       FROM mem0_import_requests
       WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+        AND cleanup_vector_id IS NULL
         AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL)
       ON CONFLICT(id) DO NOTHING
     `).bind(
@@ -494,10 +653,41 @@ async function completeDeterministicImportLease(
       UPDATE mem0_import_requests
       SET status = 'completed', error_message = NULL, updated_at = ?, completed_at = ?
       WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+        AND cleanup_vector_id IS NULL
         AND EXISTS (SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL)
     `).bind(now, now, claim.request_id, claim.lease_token, claim.request_id),
   ]);
   return Number(results[1]?.meta.changes ?? 0) === 1 ? 'processed' : 'inflight';
+}
+
+async function completeDuplicateImportLease(
+  env: Env,
+  claim: ImportRequestRow,
+  now: number,
+): Promise<ProcessMem0ImportResult> {
+  for (let reconciliation = 0; reconciliation < 8; reconciliation += 1) {
+    const pending = await findActiveImportCleanupIntent(env, claim);
+    if (pending !== undefined) {
+      await cleanupImportVector(env, claim, pending);
+      continue;
+    }
+
+    const completed = await completeImportLease(env, claim, now);
+    if (completed === 'processed') return completed;
+    if (await findActiveImportCleanupIntent(env, claim) === undefined) return 'inflight';
+  }
+
+  await env.DB.prepare(`
+    UPDATE mem0_import_requests
+    SET status = 'failed', error_message = ?, updated_at = unixepoch(), completed_at = NULL
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      AND cleanup_vector_id IS NOT NULL
+  `).bind(
+    'Mem0 import vector cleanup remained pending during duplicate completion',
+    claim.request_id,
+    claim.lease_token,
+  ).run();
+  return 'inflight';
 }
 
 async function completeImportLease(
@@ -509,6 +699,7 @@ async function completeImportLease(
     UPDATE mem0_import_requests
     SET status = 'completed', error_message = NULL, updated_at = ?, completed_at = ?
     WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      AND cleanup_vector_id IS NULL
   `).bind(now, now, claim.request_id, claim.lease_token).run();
   return Number(result.meta.changes ?? 0) === 1 ? 'processed' : 'inflight';
 }
@@ -553,7 +744,12 @@ async function claimImportRequest(env: Env, requestId: string): Promise<ImportRe
         lease_token = lease_token + 1, error_message = NULL, updated_at = unixepoch(), completed_at = NULL
     WHERE request_id = ? AND (
       status = 'queued'
-      OR (status = 'failed' AND (error_message IS NULL OR error_message NOT LIKE ?))
+      OR (status = 'failed' AND (
+        cleanup_vector_id IS NOT NULL
+        OR error_message IS NULL
+        OR error_message NOT LIKE ?
+      ))
+      OR (status = 'completed' AND cleanup_vector_id IS NOT NULL)
       OR (status = 'processing' AND updated_at < ?)
     )
     RETURNING ${IMPORT_LEDGER_COLUMNS}
@@ -563,9 +759,14 @@ async function claimImportRequest(env: Env, requestId: string): Promise<ImportRe
 
 async function importRequestDisposition(env: Env, requestId: string): Promise<ProcessMem0ImportResult> {
   const current = await findImportRequest(env, requestId);
-  if (current?.status === 'completed') return 'noop';
-  if (current?.status === 'failed' && current.error_message?.startsWith(TERMINAL_IMPORT_CONFLICT_PREFIX)) return 'noop';
-  if (current?.status === 'queued' || current?.status === 'processing' || current?.status === 'failed') return 'inflight';
+  if (current?.status === 'completed' && current.cleanup_vector_id === null) return 'noop';
+  if (current?.status === 'failed'
+    && current.cleanup_vector_id === null
+    && current.error_message?.startsWith(TERMINAL_IMPORT_CONFLICT_PREFIX)) return 'noop';
+  if (current?.status === 'queued'
+    || current?.status === 'processing'
+    || current?.status === 'failed'
+    || current?.status === 'completed') return 'inflight';
   throw new Error('Mem0 import request not found');
 }
 

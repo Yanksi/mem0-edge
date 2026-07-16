@@ -99,6 +99,7 @@ describe('database schema', () => {
       'updated_at',
       'completed_at',
       'cleanup_vector_id',
+      'cleanup_vector_generation',
     ]);
     expect(mem0ImportRequests.entityType.notNull).toBe(true);
     expect(mem0ImportRequests.entityId.notNull).toBe(true);
@@ -113,6 +114,7 @@ describe('database schema', () => {
     expect(mem0ImportRequests.createdAt.notNull).toBe(true);
     expect(mem0ImportRequests.updatedAt.notNull).toBe(true);
     expect(mem0ImportRequests.completedAt.notNull).toBe(false);
+    expect(mem0ImportRequests.cleanupVectorGeneration.default).toBe(0);
     expect(config.indexes.map((index) => index.config)).toContainEqual(
       expect.objectContaining({
         name: 'mem0_import_requests_status_updated_at_idx',
@@ -259,6 +261,9 @@ describe('database schema', () => {
       'ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_id TEXT;',
     );
     expect(memoryDeduplicationPrepareMigration).toContain(
+      'ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_generation INTEGER NOT NULL DEFAULT 0;',
+    );
+    expect(memoryDeduplicationPrepareMigration).toContain(
       'CREATE INDEX memories_active_user_agent_content_hash_lookup_idx\n  ON memories (user_id, agent_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NOT NULL;',
     );
     expect(memoryDeduplicationPrepareMigration).toContain(
@@ -292,6 +297,8 @@ describe('database schema', () => {
     expect(memoryRequests.cleanupVectorIdsJson.notNull).toBe(false);
     expect(mem0ImportRequests.cleanupVectorId.name).toBe('cleanup_vector_id');
     expect(mem0ImportRequests.cleanupVectorId.notNull).toBe(false);
+    expect(mem0ImportRequests.cleanupVectorGeneration.name).toBe('cleanup_vector_generation');
+    expect(mem0ImportRequests.cleanupVectorGeneration.notNull).toBe(true);
 
     expect(serviceSettings.id.name).toBe('id');
     expect(serviceSettings.id.primary).toBe(true);

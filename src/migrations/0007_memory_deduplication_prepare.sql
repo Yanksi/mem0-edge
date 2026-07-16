@@ -1,6 +1,7 @@
 ALTER TABLE memories ADD COLUMN content_hash TEXT;
 ALTER TABLE memory_requests ADD COLUMN cleanup_vector_ids_json TEXT;
 ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_id TEXT;
+ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_generation INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX memories_active_user_agent_content_hash_lookup_idx
   ON memories (user_id, agent_id, content_hash)

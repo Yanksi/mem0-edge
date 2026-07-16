@@ -48,6 +48,7 @@ type ImportRequestFixture = {
   lease_token: number;
   attempt_count?: number;
   cleanup_vector_id?: string | null;
+  cleanup_vector_generation?: number;
 };
 
 const duplicateMemory = (id = 'canonical-memory-id') => ({
@@ -83,8 +84,11 @@ function durableImportDb(canonical: ImportRequestFixture = {
   const canonicalRow = {
     attempt_count: 1,
     cleanup_vector_id: null,
+    cleanup_vector_generation: 0,
     ...canonical,
   };
+  let cleanupVectorId = canonicalRow.cleanup_vector_id;
+  let cleanupVectorGeneration = canonicalRow.cleanup_vector_generation;
   const events: string[] = [];
   const statements: Array<{ sql: string; bindings: unknown[] }> = [];
   let existingRead = 0;
@@ -97,12 +101,42 @@ function durableImportDb(canonical: ImportRequestFixture = {
         return statement;
       }),
       first: vi.fn(async () => {
-        if (/UPDATE mem0_import_requests/i.test(sql) && /RETURNING/i.test(sql)) return options.claim === undefined ? canonicalRow : options.claim;
+        if (/SET status = 'processing'/i.test(sql) && /RETURNING/i.test(sql)) {
+          const claimed = options.claim === undefined ? canonicalRow : options.claim;
+          return claimed === null ? null : {
+            ...claimed,
+            cleanup_vector_generation: cleanupVectorGeneration,
+            cleanup_vector_id: cleanupVectorId,
+          };
+        }
+        if (/SET cleanup_vector_id = \?/i.test(sql) && /RETURNING cleanup_vector_generation/i.test(sql)) {
+          if ((options.cleanupMarkerChanges ?? 1) === 0 || cleanupVectorId !== null) return null;
+          cleanupVectorId = call.bindings[0] as string;
+          cleanupVectorGeneration += 1;
+          return { cleanup_vector_generation: cleanupVectorGeneration };
+        }
+        if (/SET cleanup_vector_id = \?/i.test(sql) && /RETURNING request_id/i.test(sql)) {
+          cleanupVectorId = call.bindings[0] as string;
+          cleanupVectorGeneration += 1;
+          return { ...canonicalRow, cleanup_vector_id: cleanupVectorId, cleanup_vector_generation: cleanupVectorGeneration };
+        }
         if (/SELECT/i.test(sql) && /FROM mem0_import_requests/i.test(sql)) {
+          if (/cleanup_vector_id IS NOT NULL/i.test(sql)) {
+            return cleanupVectorId === null ? null : {
+              cleanup_vector_id: cleanupVectorId,
+              cleanup_vector_generation: cleanupVectorGeneration,
+            };
+          }
+          if (/SELECT request_id/i.test(sql) && /cleanup_vector_generation = \?/i.test(sql)) {
+            return cleanupVectorId === call.bindings[2]
+              && cleanupVectorGeneration === call.bindings[3]
+              ? { request_id: canonicalRow.request_id }
+              : null;
+          }
           if (options.existingRows !== undefined && existingRead < options.existingRows.length) {
             return options.existingRows[existingRead++];
           }
-          return canonicalRow;
+          return { ...canonicalRow, cleanup_vector_id: cleanupVectorId, cleanup_vector_generation: cleanupVectorGeneration };
         }
         return null;
       }),
@@ -111,15 +145,14 @@ function durableImportDb(canonical: ImportRequestFixture = {
         results: /publish_token = publish_token \+ 1/i.test(sql) ? (options.dispatchRows ?? []) : [],
         meta: { changes: options.dispatchRows?.length ?? 0 },
       })),
-      run: vi.fn(async () => ({
-        success: true,
-        results: [],
-        meta: {
-          changes: /INSERT INTO memories/i.test(sql)
-            ? (options.memoryInsertChanges ?? 1)
-            : (/SET cleanup_vector_id = \?/i.test(sql) ? (options.cleanupMarkerChanges ?? 1) : 1),
-        },
-      })),
+      run: vi.fn(async () => {
+        let changes = /INSERT INTO memories/i.test(sql) ? (options.memoryInsertChanges ?? 1) : 1;
+        if (/SET cleanup_vector_id = NULL/i.test(sql)) {
+          changes = options.cleanupMarkerChanges ?? 1;
+          if (changes === 1) cleanupVectorId = null;
+        }
+        return { success: true, results: [], meta: { changes } };
+      }),
     };
     return statement;
   });
@@ -457,6 +490,21 @@ describe('Mem0 migration imports', () => {
     expect(db.batch).not.toHaveBeenCalled();
   });
 
+  it('returns inflight when stale cleanup is re-armed after a completed-row claim miss', async () => {
+    const completed = {
+      request_id: 'stable-memory-id', entity_type: 'user' as const, entity_id: 'user-123',
+      item_json: JSON.stringify(exportedMemory), status: 'completed' as const, lease_token: 8,
+      cleanup_vector_id: 'stable-memory-id', cleanup_vector_generation: 2,
+    };
+    const db = durableImportDb(completed, { claim: null });
+
+    await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'stable-memory-id',
+    })).resolves.toBe('inflight');
+
+    expect(dependencies.deleteVector).not.toHaveBeenCalled();
+  });
+
   it('returns inflight while another import lease is active', async () => {
     const processing = {
       request_id: 'stable-memory-id', entity_type: 'user' as const, entity_id: 'user-123',
@@ -569,10 +617,11 @@ describe('Mem0 migration imports', () => {
     })).resolves.toBe('processed');
 
     expect(dependencies.deleteVector).toHaveBeenCalledWith(env.VECTORIZE, 'stable-memory-id');
-    const markerUpdates = db.statements.filter(({ sql }) => /SET cleanup_vector_id = \?/i.test(sql));
-    expect(markerUpdates.map(({ bindings }) => bindings[0])).toEqual(['stable-memory-id', null]);
-    const completionIndex = db.statements.findIndex(({ sql }) => /status = 'completed'/i.test(sql));
-    expect(db.statements.indexOf(markerUpdates[1])).toBeLessThan(completionIndex);
+    const markerArm = db.statements.find(({ sql }) => /SET cleanup_vector_id = \?/i.test(sql));
+    const markerClear = db.statements.find(({ sql }) => /SET cleanup_vector_id = NULL/i.test(sql));
+    expect(markerArm?.bindings[0]).toBe('stable-memory-id');
+    const completionIndex = db.statements.findIndex(({ sql }) => /SET status = 'completed'/i.test(sql));
+    expect(db.statements.indexOf(markerClear!)).toBeLessThan(completionIndex);
   });
 
   it('consumes a persisted cleanup marker before exact preparation and completion', async () => {
@@ -615,8 +664,8 @@ describe('Mem0 migration imports', () => {
       type: 'import-mem0-memory', requestId: 'stable-memory-id',
     })).rejects.toThrow('Vector cleanup unavailable');
     expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'failed'/i);
-    expect(db.statements.filter(({ sql }) => /SET cleanup_vector_id = \?/i.test(sql)))
-      .toHaveLength(1);
+    expect(db.statements.filter(({ sql }) => /SET cleanup_vector_id = NULL/i.test(sql)))
+      .toHaveLength(0);
 
     await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
       type: 'import-mem0-memory', requestId: 'stable-memory-id',
@@ -670,7 +719,7 @@ describe('Mem0 migration imports', () => {
       'content-hash',
       'stable-memory-id',
     );
-    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/status = 'completed'/i);
+    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/SET status = 'completed'/i);
     expect(db.statements.map(({ sql }) => sql).join('\n')).toMatch(/status = 'failed'/i);
   });
 
@@ -686,10 +735,10 @@ describe('Mem0 migration imports', () => {
 
     await expect(processMem0ImportJob({ ...env, DB: db } as unknown as Env, {
       type: 'import-mem0-memory', requestId: 'stable-memory-id',
-    })).rejects.toThrow(/lease was replaced/i);
+    })).rejects.toThrow(/cleanup became pending/i);
 
     expect(dependencies.deleteVector).not.toHaveBeenCalled();
-    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/status = 'completed'/i);
+    expect(db.statements.map(({ sql }) => sql).join('\n')).not.toMatch(/SET status = 'completed'/i);
   });
 
   it('directly embeds and stores the exact imported text with source timestamps', async () => {

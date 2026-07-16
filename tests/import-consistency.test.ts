@@ -51,7 +51,8 @@ beforeEach(async () => {
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
       completed_at INTEGER,
-      cleanup_vector_id TEXT
+      cleanup_vector_id TEXT,
+      cleanup_vector_generation INTEGER NOT NULL DEFAULT 0
     )
   `).run();
   await env.DB.prepare(`
@@ -107,6 +108,16 @@ async function cleanupMarker() {
   return env.DB.prepare(`
     SELECT cleanup_vector_id FROM mem0_import_requests WHERE request_id = 'request-1'
   `).first<{ cleanup_vector_id: string | null }>();
+}
+
+async function cleanupState() {
+  return env.DB.prepare(`
+    SELECT cleanup_vector_id, cleanup_vector_generation
+    FROM mem0_import_requests WHERE request_id = 'request-1'
+  `).first<{
+    cleanup_vector_id: string | null;
+    cleanup_vector_generation: number;
+  }>();
 }
 
 async function ledgerFailure() {
@@ -496,6 +507,197 @@ describe('durable Mem0 import processing', () => {
     await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
     await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: null });
     await expect(publicationCounts()).resolves.toEqual([1, 0]);
+  });
+
+  it('re-arms cleanup when a stale upsert lands during replacement pending cleanup', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const vectors = new Set<string>();
+    const events: string[] = [];
+    let releaseOldUpsert!: () => void;
+    const oldUpsertReleased = new Promise<void>((resolve) => {
+      releaseOldUpsert = resolve;
+    });
+    let oldWorker!: Promise<unknown>;
+    let deleteCount = 0;
+    dependencies.upsertVectors.mockImplementationOnce(async (_index, pending) => {
+      events.push('old-upsert-started');
+      await oldUpsertReleased;
+      vectors.add(pending[0].id);
+      events.push('old-upsert-finished');
+      return { mutationId: 'old-mutation' };
+    });
+    dependencies.deleteVector.mockImplementation(async (_index, vectorId) => {
+      deleteCount += 1;
+      vectors.delete(vectorId);
+      events.push(`replacement-delete-${deleteCount}`);
+      if (deleteCount === 1) {
+        releaseOldUpsert();
+        await oldWorker;
+        events.push('old-reconciled');
+      }
+    });
+
+    oldWorker = processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    });
+    await vi.waitFor(() => expect(events).toContain('old-upsert-started'));
+
+    await seedCanonicalMemory('replacement-canonical', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET updated_at = 0 WHERE request_id = 'request-1'
+    `).run();
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(events).toEqual([
+      'old-upsert-started',
+      'replacement-delete-1',
+      'old-upsert-finished',
+      'old-reconciled',
+      'replacement-delete-2',
+    ]);
+    expect(vectors).toEqual(new Set());
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: null,
+      cleanup_vector_generation: 2,
+    });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+  });
+
+  it('persists re-armed cleanup across failure and consumes it on retry', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const vectors = new Set<string>();
+    let releaseOldUpsert!: () => void;
+    const oldUpsertReleased = new Promise<void>((resolve) => {
+      releaseOldUpsert = resolve;
+    });
+    let oldWorker!: Promise<unknown>;
+    let deleteCount = 0;
+    dependencies.upsertVectors.mockImplementationOnce(async (_index, pending) => {
+      await oldUpsertReleased;
+      vectors.add(pending[0].id);
+      return { mutationId: 'old-mutation' };
+    });
+    dependencies.deleteVector.mockImplementation(async (_index, vectorId) => {
+      deleteCount += 1;
+      if (deleteCount === 1) {
+        vectors.delete(vectorId);
+        releaseOldUpsert();
+        await oldWorker;
+        return;
+      }
+      if (deleteCount === 2) {
+        await expect(cleanupState()).resolves.toEqual({
+          cleanup_vector_id: 'request-1',
+          cleanup_vector_generation: 2,
+        });
+        throw new Error('Vector cleanup crashed after stale intent was re-armed');
+      }
+      vectors.delete(vectorId);
+    });
+
+    oldWorker = processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    });
+    await vi.waitFor(() => expect(dependencies.upsertVectors).toHaveBeenCalledOnce());
+
+    await seedCanonicalMemory('replacement-canonical', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET updated_at = 0 WHERE request_id = 'request-1'
+    `).run();
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).rejects.toThrow('Vector cleanup crashed after stale intent was re-armed');
+
+    expect(vectors).toEqual(new Set(['request-1']));
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: 'request-1',
+      cleanup_vector_generation: 2,
+    });
+    await expect(ledger()).resolves.toEqual({ status: 'failed', attempt_count: 2, lease_token: 2 });
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(vectors).toEqual(new Set());
+    expect(dependencies.deleteVector).toHaveBeenCalledTimes(3);
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: null,
+      cleanup_vector_generation: 2,
+    });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 3, lease_token: 3 });
+  });
+
+  it('reclaims a completed ledger row when a crash leaves re-armed cleanup pending', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    await seedCanonicalMemory('replacement-canonical', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests
+      SET status = 'completed', cleanup_vector_id = 'request-1',
+          cleanup_vector_generation = 2, completed_at = unixepoch()
+      WHERE request_id = 'request-1'
+    `).run();
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    expect(dependencies.deleteVector).toHaveBeenCalledWith(expect.anything(), 'request-1');
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: null,
+      cleanup_vector_generation: 2,
+    });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 1, lease_token: 1 });
+    await expect(publicationCounts()).resolves.toEqual([1, 0]);
+  });
+
+  it('preserves a late stale upsert when the replacement built the deterministic row', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const vectors = new Set<string>();
+    let releaseOldUpsert!: () => void;
+    const oldUpsertReleased = new Promise<void>((resolve) => {
+      releaseOldUpsert = resolve;
+    });
+    dependencies.upsertVectors
+      .mockImplementationOnce(async (_index, pending) => {
+        await oldUpsertReleased;
+        vectors.add(pending[0].id);
+        return { mutationId: 'old-mutation' };
+      })
+      .mockImplementationOnce(async (_index, pending) => {
+        vectors.add(pending[0].id);
+        return { mutationId: 'replacement-mutation' };
+      });
+    dependencies.deleteVector.mockImplementation(async (_index, vectorId) => {
+      vectors.delete(vectorId);
+    });
+
+    const oldWorker = processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    });
+    await vi.waitFor(() => expect(dependencies.upsertVectors).toHaveBeenCalledOnce());
+
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET updated_at = 0 WHERE request_id = 'request-1'
+    `).run();
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    releaseOldUpsert();
+    await expect(oldWorker).resolves.toBe('inflight');
+
+    expect(vectors).toEqual(new Set(['request-1']));
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: null,
+      cleanup_vector_generation: 2,
+    });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+    await expect(publicationCounts()).resolves.toEqual([1, 1]);
   });
 
   it('cannot publish D1 rows after its lease is replaced during Vectorize mutation', async () => {
