@@ -27,6 +27,10 @@ import {
   serviceSettings,
 } from '../src/db/schema';
 
+function normalizeLineEndings(value: string): string {
+  return value.replace(/\r\n/g, '\n');
+}
+
 describe('database schema', () => {
   it('exposes the core database column names', () => {
     expect(apiKeys.id.name).toBe('id');
@@ -182,7 +186,7 @@ describe('database schema', () => {
       name: 'relationships_user_target_idx',
       unique: false,
     }));
-    expect(reflectGraphIndexesMigration).toBe(
+    expect(normalizeLineEndings(reflectGraphIndexesMigration)).toBe(
       'CREATE INDEX relationships_user_source_idx ON relationships (user_id, source_entity_id);\nCREATE INDEX relationships_user_target_idx ON relationships (user_id, target_entity_id);\n',
     );
   });
@@ -251,25 +255,27 @@ describe('database schema', () => {
   });
 
   it('prepares nullable deduplication and vector-cleanup columns in migration 0007', () => {
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    const migration = normalizeLineEndings(memoryDeduplicationPrepareMigration);
+
+    expect(migration).toContain(
       'ALTER TABLE memories ADD COLUMN content_hash TEXT;',
     );
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    expect(migration).toContain(
       'ALTER TABLE memory_requests ADD COLUMN cleanup_vector_ids_json TEXT;',
     );
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    expect(migration).toContain(
       'ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_id TEXT;',
     );
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    expect(migration).toContain(
       'ALTER TABLE mem0_import_requests ADD COLUMN cleanup_vector_generation INTEGER NOT NULL DEFAULT 0;',
     );
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    expect(migration).toContain(
       'CREATE INDEX memories_active_user_agent_content_hash_lookup_idx\n  ON memories (user_id, agent_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NOT NULL;',
     );
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    expect(migration).toContain(
       'CREATE INDEX memories_active_user_content_hash_lookup_idx\n  ON memories (user_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NULL;',
     );
-    expect(memoryDeduplicationPrepareMigration).toContain(
+    expect(migration).toContain(
       'CREATE INDEX memories_active_agent_content_hash_lookup_idx\n  ON memories (agent_id, content_hash)\n  WHERE deleted_at IS NULL AND user_id IS NULL AND agent_id IS NOT NULL;',
     );
   });
