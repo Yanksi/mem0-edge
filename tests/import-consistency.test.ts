@@ -501,12 +501,138 @@ describe('durable Mem0 import processing', () => {
       'candidate-deleted',
       'replacement-completed',
       'old-upsert-finished',
-      'candidate-deleted',
     ]);
-    expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
+    expect(dependencies.deleteVector).toHaveBeenCalledOnce();
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: 'request-1',
+      cleanup_vector_generation: 2,
+    });
     await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 2, lease_token: 2 });
+
+    const recoveryDelivery = queueMessage({ type: 'import-mem0-memory', requestId: 'request-1' }, 3);
+    await handleMemoryQueue(queueBatch(recoveryDelivery), env);
+
+    expect(recoveryDelivery.ack).toHaveBeenCalledOnce();
+    expect(recoveryDelivery.retry).not.toHaveBeenCalled();
+    expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 3, lease_token: 3 });
     await expect(cleanupMarker()).resolves.toEqual({ cleanup_vector_id: null });
     await expect(publicationCounts()).resolves.toEqual([1, 0]);
+  });
+
+  it('does not let a stale post-check delete a deterministic vector published by a reclaim', async () => {
+    await seedRequest('queued', Math.floor(Date.now() / 1000));
+    const vectors = new Set<string>();
+    let releaseOldUpsert!: () => void;
+    const oldUpsertReleased = new Promise<void>((resolve) => {
+      releaseOldUpsert = resolve;
+    });
+    let releaseStaleCheck!: () => void;
+    const staleCheckReleased = new Promise<void>((resolve) => {
+      releaseStaleCheck = resolve;
+    });
+    let signalStaleCheck!: () => void;
+    const staleCheckReached = new Promise<void>((resolve) => {
+      signalStaleCheck = resolve;
+    });
+    let rearmPersisted = false;
+    let staleCheckPaused = false;
+    const staleDb = {
+      prepare(sql: string) {
+        const prepared = env.DB.prepare(sql);
+        if (/cleanup_vector_generation = cleanup_vector_generation \+ 1/i.test(sql)
+          && /status IN \('processing', 'completed', 'failed'\)/i.test(sql)) {
+          return {
+            bind: (...bindings: unknown[]) => {
+              const bound = prepared.bind(...bindings);
+              return {
+                first: async <T>() => {
+                  const row = await bound.first<T>();
+                  rearmPersisted = true;
+                  return row;
+                },
+              } as unknown as D1PreparedStatement;
+            },
+          } as unknown as D1PreparedStatement;
+        }
+        if (/SELECT id, user_id, agent_id, content, content_hash, created_at, deleted_at/i.test(sql)) {
+          return {
+            bind: (...bindings: unknown[]) => {
+              const bound = prepared.bind(...bindings);
+              return {
+                first: async <T>() => {
+                  const row = await bound.first<T>();
+                  if (rearmPersisted && !staleCheckPaused) {
+                    staleCheckPaused = true;
+                    signalStaleCheck();
+                    await staleCheckReleased;
+                  }
+                  return row;
+                },
+              } as unknown as D1PreparedStatement;
+            },
+          } as unknown as D1PreparedStatement;
+        }
+        return prepared;
+      },
+      batch: env.DB.batch.bind(env.DB),
+    } as unknown as D1Database;
+    let deleteCount = 0;
+    dependencies.upsertVectors
+      .mockImplementationOnce(async (_index, pending) => {
+        await oldUpsertReleased;
+        vectors.add(pending[0].id);
+        return { mutationId: 'old-mutation' };
+      })
+      .mockImplementationOnce(async (_index, pending) => {
+        vectors.add(pending[0].id);
+        return { mutationId: 'reclaim-mutation' };
+      });
+    dependencies.deleteVector.mockImplementation(async (_index, vectorId) => {
+      deleteCount += 1;
+      vectors.delete(vectorId);
+      if (deleteCount === 2) {
+        await env.DB.prepare(`
+          UPDATE memories SET deleted_at = 2 WHERE id = 'replacement-canonical'
+        `).run();
+      }
+    });
+
+    const oldWorker = processMem0ImportJob({ ...env, DB: staleDb } as unknown as Env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    });
+    await vi.waitFor(() => expect(dependencies.upsertVectors).toHaveBeenCalledOnce());
+
+    await seedCanonicalMemory('replacement-canonical', await contentHash(item.memory));
+    await env.DB.prepare(`
+      UPDATE mem0_import_requests SET updated_at = 0 WHERE request_id = 'request-1'
+    `).run();
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+
+    releaseOldUpsert();
+    await Promise.race([
+      staleCheckReached.then(() => 'paused' as const),
+      oldWorker.then(() => 'returned' as const),
+    ]);
+
+    await expect(processMem0ImportJob(env, {
+      type: 'import-mem0-memory', requestId: 'request-1',
+    })).resolves.toBe('processed');
+    releaseStaleCheck();
+    await expect(oldWorker).resolves.toBe('inflight');
+
+    expect(deleteCount).toBe(2);
+    expect(vectors).toEqual(new Set(['request-1']));
+    await expect(cleanupState()).resolves.toEqual({
+      cleanup_vector_id: null,
+      cleanup_vector_generation: 3,
+    });
+    await expect(ledger()).resolves.toEqual({ status: 'completed', attempt_count: 3, lease_token: 3 });
+    await expect(env.DB.prepare(`
+      SELECT deleted_at FROM memories WHERE id = 'request-1'
+    `).first()).resolves.toEqual({ deleted_at: null });
   });
 
   it('re-arms cleanup when a stale upsert lands during replacement pending cleanup', async () => {

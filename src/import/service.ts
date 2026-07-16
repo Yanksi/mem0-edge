@@ -355,14 +355,42 @@ async function cleanupImportVector(
   claim: ImportRequestRow,
   intent: ImportVectorCleanupIntent,
 ): Promise<void> {
-  const occupied = await findImportMemoryById(env, intent.vectorId);
-  if (occupied?.deleted_at === null) {
-    await clearImportCleanupForCanonical(env, claim);
-    return;
+  if (!await hasActiveDeletableImportIntent(env, claim, intent)) {
+    const occupied = await findImportMemoryById(env, intent.vectorId);
+    if (occupied?.deleted_at === null) {
+      await clearImportCleanupForCanonical(env, claim);
+      return;
+    }
+    throw new TransientMem0ImportError(
+      'Mem0 import cleanup lease or generation was replaced before vector deletion',
+    );
   }
 
   await deleteVector(env.VECTORIZE, intent.vectorId);
   await clearImportCleanupIntent(env, claim, intent);
+}
+
+async function hasActiveDeletableImportIntent(
+  env: Env,
+  claim: ImportRequestRow,
+  intent: ImportVectorCleanupIntent,
+): Promise<boolean> {
+  const active = await env.DB.prepare(`
+    SELECT request_id
+    FROM mem0_import_requests
+    WHERE request_id = ? AND status = 'processing' AND lease_token = ?
+      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NULL
+      )
+  `).bind(
+    claim.request_id,
+    claim.lease_token,
+    intent.vectorId,
+    intent.generation,
+    intent.vectorId,
+  ).first<{ request_id: string }>();
+  return active !== null;
 }
 
 async function clearImportCleanupIntent(
@@ -538,69 +566,6 @@ async function reconcileLostImportVector(
     if (current?.cleanup_vector_id !== null) return;
     throw new TransientMem0ImportError('Mem0 import could not persist stale vector cleanup intent');
   }
-
-  if (rearmed.status === 'processing' || rearmed.status === 'failed') return;
-
-  const canonical = await findImportMemoryById(env, claim.request_id);
-  if (canonical?.deleted_at === null) return;
-
-  const rearmedIntent = {
-    vectorId: intent.vectorId,
-    generation: rearmed.cleanup_vector_generation,
-  };
-
-  try {
-    await deleteVector(env.VECTORIZE, intent.vectorId);
-  } catch (error) {
-    await preserveLostImportCleanup(env, rearmed, rearmedIntent, error);
-    throw new TransientMem0ImportError(
-      `Mem0 import stale vector cleanup failed: ${safeImportErrorDetail(env, error)}`,
-      { cause: error },
-    );
-  }
-
-  await clearRearmedImportCleanup(env, rearmed, rearmedIntent);
-}
-
-async function preserveLostImportCleanup(
-  env: Env,
-  current: ImportRequestRow,
-  intent: ImportVectorCleanupIntent,
-  error: unknown,
-): Promise<void> {
-  await env.DB.prepare(`
-    UPDATE mem0_import_requests
-    SET status = 'failed', error_message = ?,
-        updated_at = unixepoch(), completed_at = NULL
-    WHERE request_id = ? AND status = ? AND lease_token = ?
-      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
-  `).bind(
-    `Mem0 import stale vector cleanup failed: ${safeImportErrorDetail(env, error)}`,
-    current.request_id,
-    current.status,
-    current.lease_token,
-    intent.vectorId,
-    intent.generation,
-  ).run();
-}
-
-async function clearRearmedImportCleanup(
-  env: Env,
-  current: ImportRequestRow,
-  intent: ImportVectorCleanupIntent,
-): Promise<void> {
-  await env.DB.prepare(`
-    UPDATE mem0_import_requests
-    SET cleanup_vector_id = NULL, updated_at = unixepoch()
-    WHERE request_id = ? AND status = ? AND lease_token = ?
-      AND cleanup_vector_id = ? AND cleanup_vector_generation = ?
-  `).bind(
-    current.request_id,
-    current.status,
-    current.lease_token,
-    intent.vectorId,
-    intent.generation,
-  ).run();
 }
 
 function safeImportErrorDetail(env: Env, error: unknown): string {
