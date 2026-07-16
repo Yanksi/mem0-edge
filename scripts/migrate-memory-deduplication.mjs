@@ -509,7 +509,9 @@ export async function verifyMemoryState({
 }) {
   const hashUpdates = await pendingHashUpdates(rows);
   const updateIds = new Set(hashUpdates.map(({ id }) => id));
-  const nullHashIds = rows.filter((row) => row.content_hash === null).map((row) => row.id);
+  const nullHashIds = rows
+    .filter((row) => row.content_hash === null && updateIds.has(row.id))
+    .map((row) => row.id);
   const mismatchedHashIds = rows
     .filter((row) => row.content_hash !== null && updateIds.has(row.id))
     .map((row) => row.id);
@@ -621,22 +623,6 @@ async function writeInspectionBackup({ rows, report, config, now, mkdirImpl, wri
   return path;
 }
 
-function exactMemoryKey(row) {
-  return JSON.stringify([row.user_id, row.agent_id, row.content_hash, row.content]);
-}
-
-function recoverableLoserVectorIds(rows, decisiveLoserIds) {
-  const activeKeys = new Set(
-    rows.filter((row) => row.deleted_at === null).map(exactMemoryKey),
-  );
-  return [...new Set([
-    ...decisiveLoserIds,
-    ...rows
-      .filter((row) => row.deleted_at !== null && activeKeys.has(exactMemoryKey(row)))
-      .map((row) => row.id),
-  ])];
-}
-
 async function loadRuntime({ env, fetchImpl, readFileImpl }) {
   const secrets = validateEnvironment(env);
   const wranglerConfig = parseWranglerConfig(await readFileImpl('wrangler.toml', 'utf8'));
@@ -729,8 +715,10 @@ export async function runCommand(parsed, {
     throw new Error(`duplicate cleanup is incomplete for ${remainingMappings.length} rows; rerun apply --confirm`);
   }
 
-  const loserVectorIds = recoverableLoserVectorIds(finalRows, decisiveLoserIds);
-  const vectorDeleteResult = await deleteVectorIds({ ids: loserVectorIds, deleteVectors });
+  const deletedVectorIds = finalRows
+    .filter((row) => row.deleted_at !== null)
+    .map((row) => row.id);
+  const vectorDeleteResult = await deleteVectorIds({ ids: deletedVectorIds, deleteVectors });
   const activeRows = finalRows.filter((row) => row.deleted_at === null);
   let reindexResult = { reindexed: 0 };
   if (activeRows.length > 0) {
@@ -749,7 +737,7 @@ export async function runCommand(parsed, {
     hash_update_batches: hashResult.batches,
     duplicate_mappings_planned: mappings.length,
     duplicates_decisively_merged: decisiveLoserIds.length,
-    loser_vector_ids_submitted: vectorDeleteResult.ids,
+    deleted_vector_ids_submitted: vectorDeleteResult.ids,
     vector_delete_batches: vectorDeleteResult.batches,
     active_memories_reindexed: reindexResult.reindexed,
     operator_note: 'Vectorize deletions are asynchronous. Run verify after mutations have settled; rerun verify later if needed.',

@@ -128,23 +128,28 @@ test('duplicateMappings uses exact ascending ID order instead of locale collatio
   ]);
 });
 
-test('pendingHashUpdates hashes exact content and is idempotent on rerun', async () => {
+test('pendingHashUpdates hashes exact active content and is idempotent on rerun', async () => {
   const rows = [
-    { id: 'raw', content: ' Keep CASE and space ', content_hash: null },
+    { id: 'raw', content: ' Keep CASE and space ', content_hash: null, deleted_at: null },
     { id: 'deleted', content: 'Deleted content', content_hash: 'wrong', deleted_at: 100 },
-    { id: 'correct', content: 'Already correct', content_hash: await contentHash('Already correct') },
+    {
+      id: 'correct',
+      content: 'Already correct',
+      content_hash: await contentHash('Already correct'),
+      deleted_at: null,
+    },
   ];
 
   const updates = await pendingHashUpdates(rows);
   assert.deepEqual(updates, [
     { id: 'raw', contentHash: await contentHash(' Keep CASE and space ') },
-    { id: 'deleted', contentHash: await contentHash('Deleted content') },
   ]);
 
   const updatedRows = rows.map((row) => {
     const update = updates.find(({ id }) => id === row.id);
     return update === undefined ? row : { ...row, content_hash: update.contentHash };
   });
+  assert.equal(updatedRows[1].content_hash, 'wrong');
   assert.deepEqual(await pendingHashUpdates(updatedRows), []);
 });
 
@@ -187,6 +192,15 @@ async function createStatefulMaintenanceFake(failurePhase) {
       content_hash: null,
       created_at: 3,
       deleted_at: null,
+    },
+    {
+      id: 'unrelated-deleted',
+      user_id: 'retired-user',
+      agent_id: null,
+      content: 'retired',
+      content_hash: null,
+      created_at: 4,
+      deleted_at: 50,
     },
   ];
   const vectors = new Map(rows.map((row) => [
@@ -761,6 +775,33 @@ test('apply authenticates Dashboard before the first D1 or Vectorize mutation', 
   assert.equal(JSON.parse(calls[0].init.body).batch, undefined);
 });
 
+test('confirmed apply removes an unrelated deleted vector without mutating its D1 row', async () => {
+  const fake = await createStatefulMaintenanceFake(undefined);
+  const logs = [];
+  const errors = [];
+  const options = statefulMaintenanceOptions(fake, logs, errors);
+  const deletedRow = fake.rows.find(({ id }) => id === 'unrelated-deleted');
+  const deletedRowBefore = structuredClone(deletedRow);
+
+  assert.equal(await main(['apply', '--confirm'], options), 0);
+  assert.equal(await main(['verify'], options), 0);
+  assert.deepEqual(deletedRow, deletedRowBefore);
+  assert.equal(fake.vectors.has('unrelated-deleted'), false);
+  assert.deepEqual(fake.stats.vectorDeleteSubmissions, [[
+    'loser',
+    'unrelated-deleted',
+  ]]);
+
+  const applyLog = JSON.parse(logs[0]);
+  assert.equal(applyLog.report.deleted_vector_ids_submitted, 2);
+  const verifyLog = JSON.parse(logs.at(-1));
+  assert.equal(verifyLog.ok, true);
+  assert.equal(verifyLog.report.hash_issue_count, 0);
+  assert.deepEqual(verifyLog.report.null_hash_ids, []);
+  assert.equal(verifyLog.report.unexpected_deleted_vector_count, 0);
+  assert.deepEqual(errors, []);
+});
+
 test('confirmed apply resumes after every committed phase and converges idempotently', async (t) => {
   const scenarios = [
     'after-hash-commit',
@@ -784,9 +825,12 @@ test('confirmed apply resumes after every committed phase and converges idempote
       const canonical = fake.rows.find(({ id }) => id === 'canonical');
       const loser = fake.rows.find(({ id }) => id === 'loser');
       const other = fake.rows.find(({ id }) => id === 'other');
+      const unrelatedDeleted = fake.rows.find(({ id }) => id === 'unrelated-deleted');
       assert.equal(canonical.content_hash, await contentHash(canonical.content));
       assert.equal(loser.content_hash, await contentHash(loser.content));
       assert.equal(other.content_hash, await contentHash(other.content));
+      assert.equal(unrelatedDeleted.content_hash, null);
+      assert.equal(unrelatedDeleted.deleted_at, 50);
       assert.equal(loser.deleted_at, 100);
       assert.deepEqual([...fake.vectors.keys()].sort(), ['canonical', 'other']);
       assert.equal(fake.vectors.get('canonical').metadata.scope_key, await scopeKey(canonical));
@@ -796,7 +840,9 @@ test('confirmed apply resumes after every committed phase and converges idempote
       assert.ok(fake.stats.vectorDeleteSubmissions.length >= 1);
       assert.ok(fake.stats.vectorDeleteSubmissions.length <= 2);
       assert.ok(fake.stats.vectorDeleteSubmissions.every((ids) => (
-        ids.length === 1 && ids[0] === 'loser'
+        ids.length === 2
+          && ids[0] === 'loser'
+          && ids[1] === 'unrelated-deleted'
       )));
 
       const verifyLog = JSON.parse(logs.at(-1));
@@ -1090,7 +1136,7 @@ test('verifyMemoryState batches active and deleted vector reads and reports ever
 
   assert.equal(result.ok, false);
   assert.deepEqual(calls, [['canonical', 'duplicate'], ['missing', 'wrong-scope'], ['deleted-null']]);
-  assert.deepEqual(result.report.null_hash_ids, ['missing', 'deleted-null']);
+  assert.deepEqual(result.report.null_hash_ids, ['missing']);
   assert.deepEqual(result.report.mismatched_hash_ids, []);
   assert.deepEqual(result.report.active_duplicate_mappings, [
     { canonicalId: 'canonical', loserId: 'duplicate' },

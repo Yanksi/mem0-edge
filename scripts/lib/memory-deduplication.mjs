@@ -53,6 +53,7 @@ function compareAscending(left, right) {
 export async function pendingHashUpdates(rows) {
   const updates = [];
   for (const row of rows) {
+    if (row.deleted_at !== null) continue;
     const digest = await contentHash(row.content);
     if (row.content_hash !== digest) {
       updates.push({ id: row.id, contentHash: digest });
