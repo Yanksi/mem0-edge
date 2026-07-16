@@ -2,21 +2,19 @@ import { Hono } from 'hono';
 import { checkDashboardPassword } from '../auth';
 import { renderDashboard, renderDashboardLogin } from '../dashboard/page';
 import {
-  getDashboardDeduplicationSummary,
-  listDashboardDuplicateMemoryIds,
   listDashboardMemories,
-  listDashboardSoftDeletedMemoryIds,
+  getDashboardSettings,
   reindexDashboardMemory,
   listDashboardUsers,
   setDashboardUserAlias,
-  softDeleteDashboardMemories,
+  setDashboardSettings,
 } from '../dashboard/service';
 import type { Env } from '../env';
 import { listEntities, listRelationships } from '../graph/service';
 import { enqueueMem0AgentReclassification, enqueueMem0Import } from '../import/service';
 import { DashboardMem0ImportRequest } from '../import/types';
 import { searchMemories } from '../memory/service';
-import { deleteVectors } from '../vectorize';
+import { DedupLlmConfigurationError } from '../settings/service';
 
 type DashboardEntityType = 'user' | 'agent';
 
@@ -79,26 +77,26 @@ dashboardRoutes.get('/api/memories', async (context) => {
   return context.json(await listDashboardMemories(context.env, scope.entityType, scope.entityId, offset));
 });
 
-dashboardRoutes.get('/api/deduplication', async (context) => {
-  const scope = dashboardScope(context.req.query('entity_type'), context.req.query('entity_id'), undefined);
-  if (scope === undefined) return context.json({ error: 'Validation failed' }, 400);
-  return context.json(await getDashboardDeduplicationSummary(context.env, scope.entityType, scope.entityId));
+dashboardRoutes.get('/api/settings', async (context) => {
+  const settings = await getDashboardSettings(context.env);
+  return context.json({ semantic_dedup_enabled: settings.semantic_dedup_enabled });
 });
 
-dashboardRoutes.post('/api/deduplication', async (context) => {
+dashboardRoutes.put('/api/settings', async (context) => {
   const readOnlyError = dashboardMutationReadOnlyError(context.env);
   if (readOnlyError !== undefined) return context.json(readOnlyError, 403);
-  const body = await context.req.json<{ entity_type?: unknown; entity_id?: unknown; confirm?: unknown }>().catch(() => null);
-  const scope = body === null ? undefined : dashboardScope(body.entity_type, body.entity_id, undefined);
-  if (scope === undefined || body?.confirm !== true) return context.json({ error: 'Validation failed' }, 400);
+  const body = await context.req.json<unknown>().catch(() => null);
+  if (!isDashboardSettingsBody(body)) return context.json({ error: 'Validation failed' }, 400);
 
-  const candidates = await listDashboardDuplicateMemoryIds(context.env, scope.entityType, scope.entityId);
-  const confirmedIds = await softDeleteDashboardMemories(context.env, scope.entityType, scope.entityId, candidates);
-  const softDeletedIds = await listDashboardSoftDeletedMemoryIds(context.env, scope.entityType, scope.entityId);
-  const vectorIds = [...new Set([...confirmedIds, ...softDeletedIds])];
-
-  if (vectorIds.length > 0) await deleteVectors(context.env.VECTORIZE, vectorIds);
-  return context.json({ removed: confirmedIds.length });
+  try {
+    const settings = await setDashboardSettings(context.env, body.semantic_dedup_enabled);
+    return context.json({ semantic_dedup_enabled: settings.semantic_dedup_enabled });
+  } catch (error) {
+    if (error instanceof DedupLlmConfigurationError) {
+      return context.json({ error: 'Semantic deduplication is not configured' }, 409);
+    }
+    throw error;
+  }
 });
 
 dashboardRoutes.post('/api/memories/:id/reindex', async (context) => {
@@ -176,6 +174,14 @@ function dashboardScope(entityType: unknown, entityId: unknown, legacyUserId: un
   }
   if (typeof legacyUserId === 'string' && legacyUserId.trim() !== '') return { entityType: 'user', entityId: legacyUserId };
   return undefined;
+}
+
+function isDashboardSettingsBody(value: unknown): value is { semantic_dedup_enabled: boolean } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1
+    && keys[0] === 'semantic_dedup_enabled'
+    && typeof (value as Record<string, unknown>).semantic_dedup_enabled === 'boolean';
 }
 
 function dashboardMutationReadOnlyError(env: Env): { error: string } | undefined {

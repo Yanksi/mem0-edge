@@ -33,7 +33,9 @@ describe('GET /dashboard', () => {
     expect(html).toContain('Remote read-only preview');
     expect(html).toContain('const readonly = true;');
     expect(html).toContain("document.getElementById('alias-button').disabled = true;");
-    expect(html).toContain("document.getElementById('deduplicate-button').disabled = true;");
+    expect(html).toMatch(/id="semantic-dedup-enabled"[^>]*disabled/);
+    expect(html).toContain("document.getElementById('semantic-dedup-enabled').disabled = true;");
+    expect(html).toContain("if (view === 'settings') await loadSettings();");
     expect(html).toContain("document.querySelectorAll('#import-form input, #import-form select, #import-form textarea, #import-form button')");
     expect(html).toContain("if (state.currentView === 'graph') await loadGraph();");
     expect(html).toContain('Select the corresponding user entity to view its graph.');
@@ -95,6 +97,7 @@ describe('GET /dashboard', () => {
     expect(html).toContain('data-view="search"');
     expect(html).toContain('data-view="memories"');
     expect(html).toContain('data-view="graph"');
+    expect(html).toContain('data-view="settings"');
     expect(html).toContain('/dashboard/api/users');
     expect(html).toContain('/dashboard/api/memories');
     expect(html).toContain('/dashboard/api/graph');
@@ -147,26 +150,36 @@ describe('GET /dashboard', () => {
     expect(html).toContain('queued');
   });
 
-  it('renders exact-text deduplication navigation and its confirmed dashboard API contract', async () => {
+  it('renders system settings and removes the manual deduplication workflow', async () => {
     const response = await worker.fetch(request('/dashboard', {
       headers: { 'x-dashboard-password': 'dashboard-secret' },
     }), env);
     const html = await response.text();
 
-    expect(html).toContain('data-view="deduplicate"');
-    expect(html.indexOf('data-view="deduplicate"')).toBeGreaterThan(html.indexOf('data-view="memories"'));
-    expect(html).toContain('Deduplicate memories');
-    expect(html).toContain('id="deduplication-status"');
-    expect(html).toContain('id="deduplication-summary"');
-    expect(html).toMatch(/id="deduplicate-button"[^>]*disabled/);
-    expect(html).toContain('/dashboard/api/deduplication?entity_type=');
-    expect(html).toContain("window.confirm('Remove ' + deduplication.removable_memories");
-    expect(html).toContain("method: 'POST'");
-    expect(html).toContain('confirm: true');
-    expect(html).toContain('const entityType = state.entityType; const entityId = state.entityId;');
-    expect(html).toContain('if (entityType !== state.entityType || entityId !== state.entityId) return;');
-    expect(html).toContain('function invalidateDeduplication()');
-    expect(html).toContain('invalidateDeduplication(); await loadMemories(true);');
+    expect(html).toContain('<button type="button" data-view="settings" aria-selected="false"><span class="nav-mark">S</span>System settings</button>');
+    expect(html).toContain('<section class="view" id="view-settings">');
+    expect(html).toContain('<div class="section-head"><h2>Memory writes</h2></div>');
+    expect(html).toContain('<label class="setting-row" for="semantic-dedup-enabled">');
+    expect(html).toContain('<strong>Semantic memory deduplication</strong>');
+    expect(html).toContain('<small>Reject new memories that only restate an existing fact.</small>');
+    expect(html).toContain('<input id="semantic-dedup-enabled" type="checkbox" role="switch">');
+    expect(html).toContain('<p class="muted" id="settings-status" aria-live="polite"></p>');
+    expect(html).toContain("api('/dashboard/api/settings')");
+    expect(html).toContain("method: 'PUT'");
+    expect(html).toContain('JSON.stringify({ semantic_dedup_enabled: enabled })');
+    expect(html).toContain('if (state.settingsLoaded) return;');
+    expect(html).toContain('const previous = state.semanticDedupEnabled;');
+    expect(html).toContain('checkbox.disabled = true;');
+    expect(html).toContain('checkbox.checked = previous;');
+    expect(html).toContain("status.textContent = error.message;");
+    expect(html).toContain("status.textContent = 'Saved';");
+    expect(html).not.toContain('data-view="deduplicate"');
+    expect(html).not.toContain('Deduplicate memories');
+    expect(html).not.toContain('deduplication-summary');
+    expect(html).not.toContain('deduplicate-button');
+    expect(html).not.toContain('/dashboard/api/deduplication');
+    expect(html).not.toContain('window.confirm');
+    expect(html).not.toContain('invalidateDeduplication');
     expect(html).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');
     expect(html).toContain('grid-auto-flow: row');
     expect(html).toContain('.nav button { width: 100%; }');

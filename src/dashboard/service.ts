@@ -2,6 +2,7 @@ import type { Env } from '../env';
 import { embedText } from '../llm';
 import { memoryVectorMetadata } from '../memory/identity';
 import type { MemoryResponse } from '../memory/types';
+import { getSemanticDedupEnabled, setSemanticDedupEnabled } from '../settings/service';
 import { upsertVectors } from '../vectorize';
 
 const PAGE_SIZE = 50;
@@ -20,10 +21,8 @@ export interface DashboardMemoryPage {
   next_offset?: number;
 }
 
-export interface DashboardDeduplicationSummary {
-  duplicate_groups: number;
-  removable_memories: number;
-  previews: Array<{ memory: string; duplicate_count: number }>;
+export interface DashboardSettings {
+  semantic_dedup_enabled: boolean;
 }
 
 export async function listDashboardUsers(env: Env): Promise<DashboardEntity[]> {
@@ -80,107 +79,13 @@ export async function listDashboardMemories(env: Env, entityType: DashboardEntit
   };
 }
 
-export async function getDashboardDeduplicationSummary(
-  env: Env,
-  entityType: DashboardEntityType,
-  entityId: string,
-): Promise<DashboardDeduplicationSummary> {
-  const column = dashboardScopeColumn(entityType);
-  const [totals, previewRows] = await Promise.all([
-    env.DB.prepare(`
-      SELECT COUNT(*) AS duplicate_groups, COALESCE(SUM(duplicate_count), 0) AS removable_memories
-      FROM (
-        SELECT COUNT(*) - 1 AS duplicate_count
-        FROM memories
-        WHERE ${column} = ? AND deleted_at IS NULL
-        GROUP BY content
-        HAVING COUNT(*) >= 2
-      )
-    `).bind(entityId).first<{ duplicate_groups: number; removable_memories: number }>(),
-    env.DB.prepare(`
-      SELECT content, COUNT(*) - 1 AS duplicate_count
-      FROM memories
-      WHERE ${column} = ? AND deleted_at IS NULL
-      GROUP BY content
-      HAVING COUNT(*) >= 2
-      ORDER BY content COLLATE NOCASE
-      LIMIT 10
-    `).bind(entityId).all<{ content: string; duplicate_count: number }>(),
-  ]);
-
-  return {
-    duplicate_groups: totals?.duplicate_groups ?? 0,
-    removable_memories: totals?.removable_memories ?? 0,
-    previews: previewRows.results.map((group) => ({ memory: group.content, duplicate_count: group.duplicate_count })),
-  };
+export async function getDashboardSettings(env: Env): Promise<DashboardSettings> {
+  return { semantic_dedup_enabled: await getSemanticDedupEnabled(env) };
 }
 
-export async function listDashboardDuplicateMemoryIds(
-  env: Env,
-  entityType: DashboardEntityType,
-  entityId: string,
-): Promise<string[]> {
-  const column = dashboardScopeColumn(entityType);
-  const result = await env.DB.prepare(`
-    WITH ranked_memories AS (
-      SELECT id, created_at,
-        ROW_NUMBER() OVER (PARTITION BY content ORDER BY created_at ASC, id ASC) AS row_number
-      FROM memories
-      WHERE ${column} = ? AND deleted_at IS NULL
-    )
-    SELECT id
-    FROM ranked_memories
-    WHERE row_number > 1
-    ORDER BY created_at ASC, id ASC
-  `).bind(entityId).all<{ id: string }>();
-  return result.results.map((row) => row.id);
-}
-
-export async function listDashboardSoftDeletedMemoryIds(
-  env: Env,
-  entityType: DashboardEntityType,
-  entityId: string,
-): Promise<string[]> {
-  const column = dashboardScopeColumn(entityType);
-  const result = await env.DB.prepare(`
-    SELECT id
-    FROM memories
-    WHERE ${column} = ? AND deleted_at IS NOT NULL
-    ORDER BY id ASC
-  `).bind(entityId).all<{ id: string }>();
-  return result.results.map((row) => row.id);
-}
-
-export async function softDeleteDashboardMemories(
-  env: Env,
-  entityType: DashboardEntityType,
-  entityId: string,
-  ids: string[],
-): Promise<string[]> {
-  if (ids.length === 0) return [];
-
-  const column = dashboardScopeColumn(entityType);
-  const deleted: string[] = [];
-  for (let start = 0; start < ids.length; start += 99) {
-    const batch = ids.slice(start, start + 99);
-    const placeholders = batch.map(() => '?').join(', ');
-    const result = await env.DB.prepare(`
-      WITH ranked_memories AS (
-        SELECT id,
-          ROW_NUMBER() OVER (PARTITION BY content ORDER BY created_at ASC, id ASC) AS row_number
-        FROM memories
-        WHERE ${column} = ? AND deleted_at IS NULL
-      )
-      UPDATE memories
-      SET deleted_at = unixepoch()
-      WHERE deleted_at IS NULL
-        AND id IN (SELECT id FROM ranked_memories WHERE row_number > 1)
-        AND id IN (${placeholders})
-      RETURNING id
-    `).bind(entityId, ...batch).all<{ id: string }>();
-    deleted.push(...result.results.map((row) => row.id));
-  }
-  return deleted;
+export async function setDashboardSettings(env: Env, semanticDedupEnabled: boolean): Promise<DashboardSettings> {
+  await setSemanticDedupEnabled(env, semanticDedupEnabled);
+  return { semantic_dedup_enabled: semanticDedupEnabled };
 }
 
 export async function reindexDashboardMemory(

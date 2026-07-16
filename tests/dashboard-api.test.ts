@@ -5,14 +5,9 @@ const dashboardService = vi.hoisted(() => ({
   listDashboardUsers: vi.fn(),
   setDashboardUserAlias: vi.fn(),
   listDashboardMemories: vi.fn(),
-  getDashboardDeduplicationSummary: vi.fn(),
-  listDashboardDuplicateMemoryIds: vi.fn(),
-  listDashboardSoftDeletedMemoryIds: vi.fn(),
-  softDeleteDashboardMemories: vi.fn(),
+  getDashboardSettings: vi.fn(),
+  setDashboardSettings: vi.fn(),
   reindexDashboardMemory: vi.fn(),
-}));
-const vectorize = vi.hoisted(() => ({
-  deleteVectors: vi.fn(),
 }));
 const graphService = vi.hoisted(() => ({
   listEntities: vi.fn(),
@@ -27,12 +22,12 @@ const importService = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/dashboard/service', () => dashboardService);
-vi.mock('../src/vectorize', () => vectorize);
 vi.mock('../src/graph/service', () => graphService);
 vi.mock('../src/memory/service', () => memoryService);
 vi.mock('../src/import/service', () => importService);
 
 import worker from '../src/index';
+import { DedupLlmConfigurationError } from '../src/settings/service';
 
 const env = { DASHBOARD_PASSWORD: 'dashboard-secret', VECTORIZE: {} as VectorizeIndex } as Env;
 const readOnlyEnv = { ...env, DASHBOARD_READ_ONLY: 'true' } as Env;
@@ -57,7 +52,7 @@ describe('dashboard operator API', () => {
     const headers = { Cookie: await dashboardCookie(readOnlyEnv), 'Content-Type': 'application/json' };
     const responses = await Promise.all([
       worker.fetch(request('/dashboard/api/users/discord%3A42/alias', { method: 'PUT', headers, body: 'not-json' }), readOnlyEnv),
-      worker.fetch(request('/dashboard/api/deduplication', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
+      worker.fetch(request('/dashboard/api/settings', { method: 'PUT', headers, body: 'not-json' }), readOnlyEnv),
       worker.fetch(request('/dashboard/api/imports/mem0', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
       worker.fetch(request('/dashboard/api/entities/reclassify-agent', { method: 'POST', headers, body: 'not-json' }), readOnlyEnv),
     ]);
@@ -67,7 +62,7 @@ describe('dashboard operator API', () => {
       await expect(response.json()).resolves.toEqual({ error: 'Dashboard is read-only in this preview' });
     }
     expect(dashboardService.setDashboardUserAlias).not.toHaveBeenCalled();
-    expect(dashboardService.softDeleteDashboardMemories).not.toHaveBeenCalled();
+    expect(dashboardService.setDashboardSettings).not.toHaveBeenCalled();
     expect(importService.enqueueMem0Import).not.toHaveBeenCalled();
     expect(importService.enqueueMem0AgentReclassification).not.toHaveBeenCalled();
   });
@@ -80,206 +75,105 @@ describe('dashboard operator API', () => {
     expect(dashboardService.listDashboardUsers).not.toHaveBeenCalled();
   });
 
-  it('requires a signed dashboard session for deduplication endpoints', async () => {
-    const getResponse = await worker.fetch(request('/dashboard/api/deduplication?entity_type=agent&entity_id=hermes'), env);
-    const postResponse = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST',
+  it('requires a signed dashboard session for settings endpoints', async () => {
+    const getResponse = await worker.fetch(request('/dashboard/api/settings'), env);
+    const putResponse = await worker.fetch(request('/dashboard/api/settings', {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+      body: JSON.stringify({ semantic_dedup_enabled: true }),
     }), env);
 
     expect(getResponse.status).toBe(401);
-    expect(postResponse.status).toBe(401);
-    expect(dashboardService.getDashboardDeduplicationSummary).not.toHaveBeenCalled();
-    expect(dashboardService.listDashboardDuplicateMemoryIds).not.toHaveBeenCalled();
+    expect(putResponse.status).toBe(401);
+    expect(dashboardService.getDashboardSettings).not.toHaveBeenCalled();
+    expect(dashboardService.setDashboardSettings).not.toHaveBeenCalled();
   });
 
-  it('returns deduplication summaries for agent and user scopes', async () => {
-    dashboardService.getDashboardDeduplicationSummary
-      .mockResolvedValueOnce({ duplicate_groups: 1, removable_memories: 2, previews: [{ memory: 'Agent memory', duplicate_count: 2 }] })
-      .mockResolvedValueOnce({ duplicate_groups: 1, removable_memories: 1, previews: [{ memory: 'User memory', duplicate_count: 1 }] });
-    const cookie = await dashboardCookie();
-
-    const agentResponse = await worker.fetch(request('/dashboard/api/deduplication?entity_type=agent&entity_id=hermes', {
-      headers: { Cookie: cookie },
-    }), env);
-    const userResponse = await worker.fetch(request('/dashboard/api/deduplication?entity_type=user&entity_id=discord%3A42', {
-      headers: { Cookie: cookie },
-    }), env);
-
-    await expect(agentResponse.json()).resolves.toEqual({
-      duplicate_groups: 1, removable_memories: 2, previews: [{ memory: 'Agent memory', duplicate_count: 2 }],
+  it('returns only the current semantic deduplication setting', async () => {
+    dashboardService.getDashboardSettings.mockResolvedValue({
+      semantic_dedup_enabled: true,
+      model: 'must-not-leak',
+      threshold: 0.8,
     });
-    await expect(userResponse.json()).resolves.toEqual({
-      duplicate_groups: 1, removable_memories: 1, previews: [{ memory: 'User memory', duplicate_count: 1 }],
-    });
-    expect(dashboardService.getDashboardDeduplicationSummary).toHaveBeenNthCalledWith(1, env, 'agent', 'hermes');
-    expect(dashboardService.getDashboardDeduplicationSummary).toHaveBeenNthCalledWith(2, env, 'user', 'discord:42');
+
+    const response = await worker.fetch(request('/dashboard/api/settings', {
+      headers: { Cookie: await dashboardCookie() },
+    }), env);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ semantic_dedup_enabled: true });
+    expect(dashboardService.getDashboardSettings).toHaveBeenCalledWith(env);
   });
 
-  it('rejects invalid deduplication scopes and confirmations', async () => {
+  it('accepts only a JSON boolean semantic_dedup_enabled setting', async () => {
     const headers = { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' };
-    const missingGetScope = await worker.fetch(request('/dashboard/api/deduplication?entity_type=agent', { headers }), env);
-    const invalidGetScope = await worker.fetch(request('/dashboard/api/deduplication?entity_type=run&entity_id=run-1', { headers }), env);
-    const missingPostScope = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST', headers, body: JSON.stringify({ entity_type: 'agent', confirm: true }),
-    }), env);
-    const invalidConfirmation = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST', headers, body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42', confirm: 'true' }),
-    }), env);
-    const missingConfirmation = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST', headers, body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42' }),
-    }), env);
+    const bodies = [
+      'not-json',
+      '{}',
+      'true',
+      JSON.stringify({ semantic_dedup_enabled: 'true' }),
+      JSON.stringify({ semantic_dedup_enabled: true, model: 'secret' }),
+    ];
 
-    expect(missingGetScope.status).toBe(400);
-    expect(invalidGetScope.status).toBe(400);
-    expect(missingPostScope.status).toBe(400);
-    expect(invalidConfirmation.status).toBe(400);
-    expect(missingConfirmation.status).toBe(400);
-    expect(dashboardService.getDashboardDeduplicationSummary).not.toHaveBeenCalled();
-    expect(dashboardService.listDashboardDuplicateMemoryIds).not.toHaveBeenCalled();
+    for (const body of bodies) {
+      const response = await worker.fetch(request('/dashboard/api/settings', { method: 'PUT', headers, body }), env);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({ error: 'Validation failed' });
+    }
+    expect(dashboardService.setDashboardSettings).not.toHaveBeenCalled();
   });
 
-  it('deletes D1-confirmed agent duplicate vectors and only returns the removal count', async () => {
-    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['stale-memory', 'memory-2']);
-    dashboardService.softDeleteDashboardMemories.mockResolvedValue(['memory-2']);
-    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue(['memory-2', 'previously-deleted']);
-    vectorize.deleteVectors.mockResolvedValue(undefined);
+  it('updates and returns only the semantic deduplication setting', async () => {
+    dashboardService.setDashboardSettings.mockResolvedValue({ semantic_dedup_enabled: true, model: 'must-not-leak' });
 
-    const response = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST',
+    const response = await worker.fetch(request('/dashboard/api/settings', {
+      method: 'PUT',
       headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+      body: JSON.stringify({ semantic_dedup_enabled: true }),
     }), env);
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ removed: 1 });
-    expect(dashboardService.listDashboardDuplicateMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
-    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', ['stale-memory', 'memory-2']);
-    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
-    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['memory-2', 'previously-deleted']);
-    expect(dashboardService.listDashboardDuplicateMemoryIds.mock.invocationCallOrder[0])
-      .toBeLessThan(dashboardService.softDeleteDashboardMemories.mock.invocationCallOrder[0]);
-    expect(dashboardService.softDeleteDashboardMemories.mock.invocationCallOrder[0])
-      .toBeLessThan(vectorize.deleteVectors.mock.invocationCallOrder[0]);
+    await expect(response.json()).resolves.toEqual({ semantic_dedup_enabled: true });
+    expect(dashboardService.setDashboardSettings).toHaveBeenCalledWith(env, true);
   });
 
-  it('waits for D1 duplicate deletion before deleting vectors', async () => {
-    let resolveMemoryDeletion: ((ids: string[]) => void) | undefined;
-    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['memory-2']);
-    dashboardService.softDeleteDashboardMemories.mockImplementation(() => new Promise<string[]>((resolve) => {
-      resolveMemoryDeletion = resolve;
-    }));
-    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue([]);
-    vectorize.deleteVectors.mockResolvedValue(undefined);
+  it('maps missing semantic deduplication configuration to a conflict', async () => {
+    dashboardService.setDashboardSettings.mockRejectedValue(new DedupLlmConfigurationError(['DEDUP_LLM_API_KEY']));
 
-    const responsePromise = worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST',
+    const response = await worker.fetch(request('/dashboard/api/settings', {
+      method: 'PUT',
       headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+      body: JSON.stringify({ semantic_dedup_enabled: true }),
     }), env);
 
-    await vi.waitFor(() => expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledTimes(1));
-    expect(vectorize.deleteVectors).not.toHaveBeenCalled();
-
-    resolveMemoryDeletion!(['memory-2']);
-    const response = await responsePromise;
-
-    expect(response.status).toBe(200);
-    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['memory-2']);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: 'Semantic deduplication is not configured' });
   });
 
-  it('does not delete vectors when D1 confirms no duplicate deletions', async () => {
-    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue(['stale-memory']);
-    dashboardService.softDeleteDashboardMemories.mockResolvedValue([]);
-    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue([]);
+  it('allows disabling semantic deduplication when dedicated configuration is absent', async () => {
+    dashboardService.setDashboardSettings.mockResolvedValue({ semantic_dedup_enabled: false });
 
-    const response = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST',
+    const response = await worker.fetch(request('/dashboard/api/settings', {
+      method: 'PUT',
       headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
+      body: JSON.stringify({ semantic_dedup_enabled: false }),
     }), env);
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ removed: 0 });
-    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', ['stale-memory']);
-    expect(vectorize.deleteVectors).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual({ semantic_dedup_enabled: false });
+    expect(dashboardService.setDashboardSettings).toHaveBeenCalledWith(env, false);
   });
 
-  it('checks soft-deleted IDs after a user scope has no duplicate candidates', async () => {
-    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue([]);
-    dashboardService.softDeleteDashboardMemories.mockResolvedValue([]);
-    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue([]);
+  it('propagates unexpected settings service errors', async () => {
+    dashboardService.setDashboardSettings.mockRejectedValue(new Error('D1 unavailable'));
 
-    const response = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST',
+    const response = await worker.fetch(request('/dashboard/api/settings', {
+      method: 'PUT',
       headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_type: 'user', entity_id: 'discord:42', confirm: true }),
+      body: JSON.stringify({ semantic_dedup_enabled: false }),
     }), env);
 
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ removed: 0 });
-    expect(dashboardService.listDashboardDuplicateMemoryIds).toHaveBeenCalledWith(env, 'user', 'discord:42');
-    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'user', 'discord:42', []);
-    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenCalledWith(env, 'user', 'discord:42');
-    expect(vectorize.deleteVectors).not.toHaveBeenCalled();
-  });
-
-  it('retries failed agent vector cleanup using scoped soft-deleted memory IDs', async () => {
-    dashboardService.listDashboardDuplicateMemoryIds.mockResolvedValue([]);
-    dashboardService.softDeleteDashboardMemories.mockResolvedValue([]);
-    dashboardService.listDashboardSoftDeletedMemoryIds.mockResolvedValue(['retry-memory']);
-    vectorize.deleteVectors.mockResolvedValue(undefined);
-
-    const response = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST',
-      headers: { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true }),
-    }), env);
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ removed: 0 });
-    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenCalledWith(env, 'agent', 'hermes', []);
-    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenCalledWith(env, 'agent', 'hermes');
-    expect(vectorize.deleteVectors).toHaveBeenCalledWith(env.VECTORIZE, ['retry-memory']);
-  });
-
-  it('recovers a failed vector cleanup without exposing internal IDs', async () => {
-    dashboardService.listDashboardDuplicateMemoryIds
-      .mockResolvedValueOnce(['retry-memory'])
-      .mockResolvedValueOnce([]);
-    dashboardService.softDeleteDashboardMemories
-      .mockResolvedValueOnce(['retry-memory'])
-      .mockResolvedValueOnce([]);
-    dashboardService.listDashboardSoftDeletedMemoryIds
-      .mockResolvedValueOnce(['retry-memory'])
-      .mockResolvedValueOnce(['retry-memory']);
-    vectorize.deleteVectors
-      .mockRejectedValueOnce(new Error('Vectorize cleanup failed for retry-memory'))
-      .mockResolvedValueOnce(undefined);
-    const headers = { Cookie: await dashboardCookie(), 'Content-Type': 'application/json' };
-    const body = JSON.stringify({ entity_type: 'agent', entity_id: 'hermes', confirm: true });
-
-    const failedResponse = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST', headers, body,
-    }), env);
-
-    expect(failedResponse.status).toBe(500);
-    const failedBody = await failedResponse.text();
-    expect(failedBody).not.toContain('retry-memory');
-    expect(failedBody).not.toContain('Vectorize');
-    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenNthCalledWith(1, env, 'agent', 'hermes', ['retry-memory']);
-    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenNthCalledWith(1, env, 'agent', 'hermes');
-
-    const recoveredResponse = await worker.fetch(request('/dashboard/api/deduplication', {
-      method: 'POST', headers, body,
-    }), env);
-
-    expect(recoveredResponse.status).toBe(200);
-    await expect(recoveredResponse.json()).resolves.toEqual({ removed: 0 });
-    expect(dashboardService.softDeleteDashboardMemories).toHaveBeenNthCalledWith(2, env, 'agent', 'hermes', []);
-    expect(dashboardService.listDashboardSoftDeletedMemoryIds).toHaveBeenNthCalledWith(2, env, 'agent', 'hermes');
-    expect(vectorize.deleteVectors).toHaveBeenNthCalledWith(2, env.VECTORIZE, ['retry-memory']);
+    expect(response.status).toBe(500);
   });
 
   it('discovers users through the dashboard service', async () => {
