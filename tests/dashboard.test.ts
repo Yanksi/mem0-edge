@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { graphResponseMatchesSelection } from '../src/dashboard/page';
+import { describe, expect, it, vi } from 'vitest';
+import { createDashboardSettingsController, graphResponseMatchesSelection } from '../src/dashboard/page';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 
@@ -19,6 +19,159 @@ describe('graphResponseMatchesSelection', () => {
   it('rejects an old graph response after the entity selection changes', () => {
     expect(graphResponseMatchesSelection('user', 'old-user', 'user', 'new-user')).toBe(false);
     expect(graphResponseMatchesSelection('user', 'new-user', 'user', 'new-user')).toBe(true);
+  });
+});
+
+interface SettingsControl {
+  checked: boolean;
+  disabled: boolean;
+}
+
+interface SettingsStatus {
+  textContent: string;
+  className: string;
+}
+
+interface SettingsController {
+  load(): Promise<void>;
+  save(): Promise<void>;
+  clearStatus(): void;
+}
+
+type SettingsRequest = () => Promise<{ semantic_dedup_enabled: boolean }>;
+type SettingsSaveRequest = (enabled: boolean) => Promise<{ semantic_dedup_enabled: boolean }>;
+
+function createSettingsController(
+  checkbox: SettingsControl,
+  status: SettingsStatus,
+  load: SettingsRequest,
+  save: SettingsSaveRequest,
+  readonly = false,
+): SettingsController {
+  return createDashboardSettingsController(readonly, checkbox, status, load, save);
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+describe('dashboard settings client', () => {
+  it('keeps the writable switch disabled and retries after an initial GET failure', async () => {
+    const checkbox = { checked: false, disabled: true };
+    const status = { textContent: '', className: 'muted' };
+    const load = vi.fn().mockRejectedValue(new Error('Settings unavailable'));
+    const save = vi.fn();
+    const controller = createSettingsController(checkbox, status, load, save);
+
+    await controller.load();
+
+    expect(checkbox.disabled).toBe(true);
+    expect(status).toEqual({ textContent: 'Settings unavailable', className: 'muted error' });
+    expect(save).not.toHaveBeenCalled();
+
+    await controller.load();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(checkbox.disabled).toBe(true);
+  });
+
+  it('shares one in-flight GET across repeated settings navigation', async () => {
+    const response = deferred<{ semantic_dedup_enabled: boolean }>();
+    const checkbox = { checked: false, disabled: true };
+    const status = { textContent: '', className: 'muted' };
+    const load = vi.fn(() => response.promise);
+    const controller = createSettingsController(checkbox, status, load, vi.fn());
+
+    const first = controller.load();
+    const second = controller.load();
+
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(checkbox.disabled).toBe(true);
+
+    response.resolve({ semantic_dedup_enabled: true });
+    await Promise.all([first, second]);
+    expect(checkbox.checked).toBe(true);
+  });
+
+  it('enables the writable switch only after an authoritative GET succeeds', async () => {
+    const checkbox = { checked: false, disabled: true };
+    const status = { textContent: '', className: 'muted' };
+    const controller = createSettingsController(
+      checkbox,
+      status,
+      vi.fn().mockResolvedValue({ semantic_dedup_enabled: true }),
+      vi.fn(),
+    );
+
+    await controller.load();
+
+    expect(checkbox).toEqual({ checked: true, disabled: false });
+    expect(status).toEqual({ textContent: '', className: 'muted' });
+  });
+
+  it('restores the authoritative setting when PUT fails', async () => {
+    const checkbox = { checked: false, disabled: true };
+    const status = { textContent: '', className: 'muted' };
+    const save = vi.fn().mockRejectedValue(new Error('Semantic deduplication is not configured'));
+    const controller = createSettingsController(
+      checkbox,
+      status,
+      vi.fn().mockResolvedValue({ semantic_dedup_enabled: false }),
+      save,
+    );
+    await controller.load();
+
+    checkbox.checked = true;
+    await controller.save();
+
+    expect(save).toHaveBeenCalledWith(true);
+    expect(checkbox).toEqual({ checked: false, disabled: false });
+    expect(status).toEqual({
+      textContent: 'Semantic deduplication is not configured',
+      className: 'muted error',
+    });
+  });
+
+  it('waits for the authoritative GET before PUT so a stale load cannot overwrite the save', async () => {
+    const response = deferred<{ semantic_dedup_enabled: boolean }>();
+    const checkbox = { checked: false, disabled: true };
+    const status = { textContent: '', className: 'muted' };
+    const save = vi.fn().mockResolvedValue({ semantic_dedup_enabled: true });
+    const controller = createSettingsController(checkbox, status, vi.fn(() => response.promise), save);
+
+    const loadPromise = controller.load();
+    checkbox.checked = true;
+    const savePromise = controller.save();
+
+    expect(save).not.toHaveBeenCalled();
+    response.resolve({ semantic_dedup_enabled: false });
+    await Promise.all([loadPromise, savePromise]);
+
+    expect(save).toHaveBeenCalledWith(true);
+    expect(checkbox).toEqual({ checked: true, disabled: false });
+    expect(status.textContent).toBe('Saved');
+  });
+
+  it('clears stale settings status while preserving the live region element', async () => {
+    const checkbox = { checked: false, disabled: true };
+    const status = { textContent: '', className: 'muted' };
+    const controller = createSettingsController(
+      checkbox,
+      status,
+      vi.fn().mockResolvedValue({ semantic_dedup_enabled: false }),
+      vi.fn().mockResolvedValue({ semantic_dedup_enabled: true }),
+    );
+    await controller.load();
+    checkbox.checked = true;
+    await controller.save();
+    expect(status.textContent).toBe('Saved');
+
+    controller.clearStatus();
+
+    expect(status).toEqual({ textContent: '', className: 'muted' });
   });
 });
 
@@ -162,17 +315,13 @@ describe('GET /dashboard', () => {
     expect(html).toContain('<label class="setting-row" for="semantic-dedup-enabled">');
     expect(html).toContain('<strong>Semantic memory deduplication</strong>');
     expect(html).toContain('<small>Reject new memories that only restate an existing fact.</small>');
-    expect(html).toContain('<input id="semantic-dedup-enabled" type="checkbox" role="switch">');
+    expect(html).toContain('<input id="semantic-dedup-enabled" type="checkbox" role="switch" disabled>');
     expect(html).toContain('<p class="muted" id="settings-status" aria-live="polite"></p>');
     expect(html).toContain("api('/dashboard/api/settings')");
     expect(html).toContain("method: 'PUT'");
     expect(html).toContain('JSON.stringify({ semantic_dedup_enabled: enabled })');
-    expect(html).toContain('if (state.settingsLoaded) return;');
-    expect(html).toContain('const previous = state.semanticDedupEnabled;');
-    expect(html).toContain('checkbox.disabled = true;');
-    expect(html).toContain('checkbox.checked = previous;');
-    expect(html).toContain("status.textContent = error.message;");
-    expect(html).toContain("status.textContent = 'Saved';");
+    expect(html).toContain('createDashboardSettingsController(readonly');
+    expect(html).toContain('settingsController.clearStatus();');
     expect(html).not.toContain('data-view="deduplicate"');
     expect(html).not.toContain('Deduplicate memories');
     expect(html).not.toContain('deduplication-summary');

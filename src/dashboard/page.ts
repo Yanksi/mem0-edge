@@ -7,6 +7,104 @@ export function graphResponseMatchesSelection(
   return requestedEntityType === currentEntityType && requestedEntityId === currentEntityId;
 }
 
+interface DashboardSettingsControl {
+  checked: boolean;
+  disabled: boolean;
+}
+
+interface DashboardSettingsStatus {
+  textContent: string;
+  className: string;
+}
+
+interface DashboardSettingsResponse {
+  semantic_dedup_enabled: boolean;
+}
+
+export function createDashboardSettingsController(
+  readOnly: boolean,
+  checkbox: DashboardSettingsControl,
+  status: DashboardSettingsStatus,
+  loadRequest: () => Promise<DashboardSettingsResponse>,
+  saveRequest: (enabled: boolean) => Promise<DashboardSettingsResponse>,
+): { load(): Promise<void>; save(): Promise<void>; clearStatus(): void } {
+  let authoritativeEnabled: boolean | undefined;
+  let settingsLoaded = false;
+  let loadPromise: Promise<void> | undefined;
+  let requestGeneration = 0;
+
+  function showError(error: unknown): void {
+    status.textContent = error instanceof Error ? error.message : 'Request failed';
+    status.className = 'muted error';
+  }
+
+  async function load(): Promise<void> {
+    if (settingsLoaded) return;
+    if (loadPromise !== undefined) return loadPromise;
+
+    checkbox.disabled = true;
+    status.textContent = 'Loading...';
+    status.className = 'muted';
+    const generation = ++requestGeneration;
+    const request = (async () => {
+      try {
+        const body = await loadRequest();
+        if (generation !== requestGeneration) return;
+        authoritativeEnabled = body.semantic_dedup_enabled;
+        settingsLoaded = true;
+        checkbox.checked = authoritativeEnabled;
+        status.textContent = '';
+        status.className = 'muted';
+      } catch (error) {
+        if (generation !== requestGeneration) return;
+        settingsLoaded = false;
+        showError(error);
+      } finally {
+        if (generation === requestGeneration) checkbox.disabled = readOnly || !settingsLoaded;
+        loadPromise = undefined;
+      }
+    })();
+    loadPromise = request;
+    return request;
+  }
+
+  async function save(): Promise<void> {
+    const enabled = checkbox.checked;
+    if (loadPromise !== undefined) await loadPromise;
+    if (!settingsLoaded || authoritativeEnabled === undefined) {
+      checkbox.disabled = true;
+      return;
+    }
+
+    const previous = authoritativeEnabled;
+    checkbox.disabled = true;
+    status.textContent = 'Saving...';
+    status.className = 'muted';
+    const generation = ++requestGeneration;
+    try {
+      const body = await saveRequest(enabled);
+      if (generation !== requestGeneration) return;
+      authoritativeEnabled = body.semantic_dedup_enabled;
+      checkbox.checked = authoritativeEnabled;
+      status.textContent = 'Saved';
+      status.className = 'muted';
+    } catch (error) {
+      if (generation !== requestGeneration) return;
+      checkbox.checked = previous;
+      showError(error);
+    } finally {
+      if (generation === requestGeneration) checkbox.disabled = readOnly;
+    }
+  }
+
+  function clearStatus(): void {
+    status.textContent = '';
+    status.className = 'muted';
+  }
+
+  return { load, save, clearStatus };
+}
+
 export function renderDashboardLogin(): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mem0 Edge Dashboard</title></head><body><main><h1>Mem0 Edge Dashboard</h1><p>Unauthorized</p><form action="/dashboard/login" method="post"><label>Password <input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Sign in</button></form></main></body></html>`;
 }
@@ -75,7 +173,7 @@ export function renderDashboard(readonly = false): string {
         <div class="section-head"><h2>Memory writes</h2></div>
         <label class="setting-row" for="semantic-dedup-enabled">
           <span><strong>Semantic memory deduplication</strong><small>Reject new memories that only restate an existing fact.</small></span>
-          <input id="semantic-dedup-enabled" type="checkbox" role="switch"${readonly ? ' disabled' : ''}>
+          <input id="semantic-dedup-enabled" type="checkbox" role="switch" disabled>
         </label>
         <p class="muted" id="settings-status" aria-live="polite"></p>
       </section>
@@ -105,9 +203,13 @@ export function renderDashboard(readonly = false): string {
   <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.34.0/dist/cytoscape.min.js" integrity="sha384-K+k+ywfDuvV9dwg+bwsVE0WGkrTnqFamaER+ydBgMFQTtlI0jdI9no9AjkQHwh/T" crossorigin="anonymous"></script>
   <script>
     const readonly = ${readonly};
-    const state = { entityType: '', entityId: '', users: [], offset: 0, nextOffset: null, memories: [], settingsLoaded: false, semanticDedupEnabled: false, currentView: 'search', targetUserIdManuallyOverridden: false };
+    const state = { entityType: '', entityId: '', users: [], offset: 0, nextOffset: null, memories: [], currentView: 'search', targetUserIdManuallyOverridden: false };
     const labels = { search: ['Search memory', 'Semantic recall across a selected memory entity.'], memories: ['All memories', 'Browse every active memory, newest first.'], settings: ['System settings', 'Manage memory write behavior.'], graph: ['Memory graph', 'Explore entities and the relationships inferred from stored memories.'], import: ['Import from Mem0', 'Queue a RawMemoryMigrationExport for direct memory migration.'] };
     const select = document.getElementById('user-select');
+    ${createDashboardSettingsController.toString()}
+    const settingsCheckbox = document.getElementById('semantic-dedup-enabled');
+    const settingsStatus = document.getElementById('settings-status');
+    const settingsController = createDashboardSettingsController(readonly, settingsCheckbox, settingsStatus, () => api('/dashboard/api/settings'), (enabled) => api('/dashboard/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ semantic_dedup_enabled: enabled }) }));
     if (readonly) { document.getElementById('alias-button').disabled = true; document.getElementById('semantic-dedup-enabled').disabled = true; document.querySelectorAll('#import-form input, #import-form select, #import-form textarea, #import-form button').forEach((control) => { control.disabled = true; }); }
     async function api(path, init) { const response = await fetch(path, init); const body = await response.json(); if (!response.ok) throw new Error(body.error || 'Request failed'); return body; }
     function selectedUser() { return state.users.find((user) => user.entity_type === state.entityType && user.entity_id === state.entityId); }
@@ -117,8 +219,8 @@ export function renderDashboard(readonly = false): string {
     function renderRows(target, rows, empty) { target.replaceChildren(); if (rows.length === 0) { const item = document.createElement('p'); item.className = 'empty'; item.textContent = empty; target.append(item); return; } rows.forEach((memory) => { const row = document.createElement('article'); row.className = 'memory-row'; const summary = document.createElement('button'); summary.type = 'button'; summary.className = 'memory-summary'; const content = document.createElement('span'); content.className = 'memory-main'; content.textContent = memory.memory; const meta = document.createElement('span'); meta.className = 'memory-meta'; const score = memory.score === undefined ? '' : 'Score ' + memory.score.toFixed(3); meta.textContent = [score, memory.created_at ? new Date(memory.created_at).toLocaleString() : '', memory.metadata && memory.metadata.source ? 'Source: ' + memory.metadata.source : ''].filter(Boolean).join(' | '); const detail = document.createElement('aside'); detail.className = 'detail memory-detail'; detail.hidden = true; populateDetail(detail, memory); summary.append(content, meta); summary.addEventListener('click', () => { const wasExpanded = !detail.hidden; target.querySelectorAll('.memory-detail').forEach((panel) => { panel.hidden = true; }); detail.hidden = wasExpanded; }); row.append(summary, detail); target.append(row); }); }
     async function loadUsers() { const previous = state.entityType + ':' + state.entityId; const body = await api('/dashboard/api/users'); state.users = body.results; select.replaceChildren(); if (state.users.length === 0) { state.entityId = ''; const option = new Option('No stored entities', ''); select.append(option); return; } state.users.forEach((user) => select.append(new Option(profileLabel(user), user.entity_type + ':' + user.entity_id))); const selected = state.users.find((user) => user.entity_type + ':' + user.entity_id === previous) || state.users[0]; state.entityType = selected.entity_type; state.entityId = selected.entity_id; select.value = state.entityType + ':' + state.entityId; await loadMemories(true); }
     async function loadMemories(reset) { if (!state.entityId) return; const status = document.getElementById('memory-status'); if (reset) { state.offset = 0; state.memories = []; } status.textContent = 'Loading...'; try { const body = await api('/dashboard/api/memories?entity_type=' + encodeURIComponent(state.entityType) + '&entity_id=' + encodeURIComponent(state.entityId) + '&offset=' + state.offset); state.memories = reset ? body.results : state.memories.concat(body.results); state.nextOffset = body.next_offset ?? null; renderRows(document.getElementById('memory-results'), state.memories, 'No active memories for this entity.'); document.getElementById('load-more').hidden = state.nextOffset === null; status.textContent = state.memories.length + ' loaded'; } catch (error) { status.textContent = error.message; status.className = 'muted error'; } }
-    async function loadSettings() { if (state.settingsLoaded) return; const checkbox = document.getElementById('semantic-dedup-enabled'); const status = document.getElementById('settings-status'); checkbox.disabled = true; status.textContent = 'Loading...'; status.className = 'muted'; try { const body = await api('/dashboard/api/settings'); state.semanticDedupEnabled = body.semantic_dedup_enabled; checkbox.checked = state.semanticDedupEnabled; state.settingsLoaded = true; status.textContent = ''; } catch (error) { status.textContent = error.message; status.className = 'muted error'; } finally { checkbox.disabled = readonly; } }
-    async function saveSettings() { const checkbox = document.getElementById('semantic-dedup-enabled'); const status = document.getElementById('settings-status'); const previous = state.semanticDedupEnabled; const enabled = checkbox.checked; checkbox.disabled = true; status.textContent = 'Saving...'; status.className = 'muted'; try { const body = await api('/dashboard/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ semantic_dedup_enabled: enabled }) }); state.semanticDedupEnabled = body.semantic_dedup_enabled; checkbox.checked = state.semanticDedupEnabled; status.textContent = 'Saved'; } catch (error) { checkbox.checked = previous; status.textContent = error.message; status.className = 'muted error'; } finally { checkbox.disabled = readonly; } }
+    async function loadSettings() { await settingsController.load(); }
+    async function saveSettings() { await settingsController.save(); }
     async function search(event) { event.preventDefault(); const query = String(new FormData(event.currentTarget).get('query') || ''); const status = document.getElementById('search-status'); status.textContent = 'Searching...'; try { const body = await api('/dashboard/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: state.entityType, entity_id: state.entityId, query }) }); renderRows(document.getElementById('search-results'), body.results, 'No relevant memories found.'); status.textContent = body.results.length + ' results'; } catch (error) { status.textContent = error.message; status.className = 'muted error'; } }
     function graphElements(body) { return [...body.entities.map((entity) => ({ group: 'nodes', data: { id: entity.id, label: entity.name, entity } })), ...body.relationships.map((relationship) => ({ group: 'edges', data: { id: relationship.id, source: relationship.source_entity_id, target: relationship.target_entity_id, label: relationship.relation_type } }))]; }
     ${graphResponseMatchesSelection.toString()}
@@ -126,7 +228,7 @@ export function renderDashboard(readonly = false): string {
     function filenameUserId(fileName) { return fileName.toLowerCase().endsWith('.json') ? fileName.slice(0, -5) : ''; }
     async function loadImportFile(event) { const file = event.currentTarget.files && event.currentTarget.files[0]; if (!file) return; const exportJson = document.getElementById('export-json'); exportJson.value = await file.text(); const target = document.getElementById('target-user-id'); const derivedUserId = filenameUserId(file.name); if (!state.targetUserIdManuallyOverridden && derivedUserId) target.value = derivedUserId; }
     async function importMem0(event) { event.preventDefault(); const status = document.getElementById('import-status'); const target = document.getElementById('target-user-id'); const entityType = document.getElementById('target-entity-type'); const exportJson = document.getElementById('export-json'); let exportData; try { exportData = JSON.parse(exportJson.value); } catch { status.textContent = 'Enter valid JSON.'; status.className = 'muted error'; return; } status.textContent = 'Queueing...'; status.className = 'muted'; try { const body = await api('/dashboard/api/imports/mem0', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: entityType.value, entity_id: target.value, export: exportData }) }); status.textContent = body.queued + ' memories queued'; } catch (error) { status.textContent = error.message; status.className = 'muted error'; } }
-    document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', async () => { const view = button.dataset.view; state.currentView = view; document.querySelectorAll('[data-view]').forEach((item) => item.setAttribute('aria-selected', String(item === button))); document.querySelectorAll('.view').forEach((item) => item.classList.toggle('active', item.id === 'view-' + view)); document.getElementById('page-title').textContent = labels[view][0]; document.getElementById('page-subtitle').textContent = labels[view][1]; document.getElementById('graph-detail').hidden = true; if (view === 'memories') await loadMemories(true); if (view === 'settings') await loadSettings(); if (view === 'graph') await loadGraph(); }));
+    document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', async () => { const view = button.dataset.view; if ((state.currentView === 'settings') !== (view === 'settings')) settingsController.clearStatus(); state.currentView = view; document.querySelectorAll('[data-view]').forEach((item) => item.setAttribute('aria-selected', String(item === button))); document.querySelectorAll('.view').forEach((item) => item.classList.toggle('active', item.id === 'view-' + view)); document.getElementById('page-title').textContent = labels[view][0]; document.getElementById('page-subtitle').textContent = labels[view][1]; document.getElementById('graph-detail').hidden = true; if (view === 'memories') await loadMemories(true); if (view === 'settings') await loadSettings(); if (view === 'graph') await loadGraph(); }));
     select.addEventListener('change', async () => { const [entityType, ...id] = select.value.split(':'); state.entityType = entityType; state.entityId = id.join(':'); document.getElementById('graph-detail').hidden = true; await loadMemories(true); if (state.currentView === 'graph') await loadGraph(); }); document.getElementById('search-form').addEventListener('submit', search); document.getElementById('load-more').addEventListener('click', async () => { state.offset = state.nextOffset; await loadMemories(false); }); document.getElementById('semantic-dedup-enabled').addEventListener('change', saveSettings); document.getElementById('alias-button').addEventListener('click', async () => { const user = selectedUser(); if (!user || user.entity_type !== 'user') return; const alias = prompt('Alias for ' + user.entity_id, user.alias || ''); if (alias === null) return; try { await api('/dashboard/api/users/' + encodeURIComponent(user.entity_id) + '/alias', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ alias }) }); await loadUsers(); } catch (error) { alert(error.message); } }); document.getElementById('target-user-id').addEventListener('input', () => { state.targetUserIdManuallyOverridden = true; }); document.getElementById('import-file').addEventListener('change', loadImportFile); document.getElementById('import-form').addEventListener('submit', importMem0);
     loadUsers().catch((error) => { select.replaceChildren(new Option(error.message, '')); });
   </script>
