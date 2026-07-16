@@ -1,7 +1,16 @@
 import { z } from 'zod';
 import type { Env } from '../env';
 import { UpstreamServiceError } from '../llm';
-import { assertDedupLlmConfigured } from '../settings/service';
+import { assertDedupLlmConfigured, type RetryableDedupLlmError } from '../settings/service';
+
+export class DedupLlmProviderError extends Error implements RetryableDedupLlmError {
+  readonly retryable: true = true;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'DedupLlmProviderError';
+  }
+}
 
 export interface DedupCandidate {
   ref: string;
@@ -92,21 +101,24 @@ export async function selectSemanticDuplicate(env: Env, input: DedupLlmInput): P
       }),
     });
   } catch (error) {
-    throw new Error(`Semantic deduplication request failed: ${errorMessage(error)}`);
+    throw new DedupLlmProviderError(
+      `Semantic deduplication request failed: ${errorMessage(error)}`,
+      { cause: error },
+    );
   }
 
   if (!response.ok) {
-    throw new UpstreamServiceError(
-      `Semantic deduplication request failed (${response.status} ${response.statusText})`,
-      response.status,
-    );
+    throw retryableHttpError(response);
   }
 
   let responseBody: string;
   try {
     responseBody = await response.text();
   } catch (error) {
-    throw new Error(`Semantic deduplication request failed: ${errorMessage(error)}`);
+    throw new DedupLlmProviderError(
+      `Semantic deduplication request failed: ${errorMessage(error)}`,
+      { cause: error },
+    );
   }
 
   let payload: unknown;
@@ -141,8 +153,18 @@ export async function selectSemanticDuplicate(env: Env, input: DedupLlmInput): P
   return duplicateOf;
 }
 
-function invalidResult(): Error {
-  return new Error('Semantic deduplication response contained an invalid result');
+function invalidResult(): DedupLlmProviderError {
+  return new DedupLlmProviderError('Semantic deduplication response contained an invalid result');
+}
+
+function retryableHttpError(response: Response): UpstreamServiceError & RetryableDedupLlmError {
+  return Object.assign(
+    new UpstreamServiceError(
+      `Semantic deduplication request failed (${response.status} ${response.statusText})`,
+      response.status,
+    ),
+    { retryable: true as const },
+  );
 }
 
 function normalizeBaseUrl(value: string): string {

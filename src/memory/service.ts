@@ -623,11 +623,11 @@ function isTransientInfrastructureError(error: unknown): boolean {
   if (error instanceof TransientMemoryJobError) return true;
   if (typeof error !== 'object' || error === null) return false;
   const candidate = error as { retryable?: unknown; status?: unknown; message?: unknown };
+  if (candidate.retryable === true) return true;
   if (typeof candidate.status === 'number') {
     if ([400, 401, 403, 404, 422].includes(candidate.status)) return false;
     if ([408, 409, 425, 429].includes(candidate.status) || candidate.status >= 500) return true;
   }
-  if (candidate.retryable === true) return true;
   return typeof candidate.message === 'string'
     && /\b(d1|database|llm|openai|embed(?:ding)?|vector|network|timeout|temporar(?:y|ily)|unavailable)\b/i.test(candidate.message);
 }

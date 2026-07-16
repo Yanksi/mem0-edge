@@ -1,6 +1,11 @@
 import type { Env } from '../env';
 
-export class DedupLlmConfigurationError extends Error {
+export interface RetryableDedupLlmError {
+  readonly retryable: true;
+}
+
+export class DedupLlmConfigurationError extends Error implements RetryableDedupLlmError {
+  readonly retryable: true = true;
   readonly missingVariables: readonly string[];
 
   constructor(missingVariables: readonly string[]) {

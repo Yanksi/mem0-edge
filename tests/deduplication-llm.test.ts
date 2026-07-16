@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/env';
 import { UpstreamServiceError } from '../src/llm';
-import { DedupLlmConfigurationError } from '../src/settings/service';
+import { DedupLlmConfigurationError, type RetryableDedupLlmError } from '../src/settings/service';
 import {
   selectSemanticDuplicate,
   type DedupLlmInput,
@@ -134,17 +134,19 @@ describe('selectSemanticDuplicate', () => {
       new Response(JSON.stringify(payload), { status: 200 }),
     ));
 
-    await expect(selectSemanticDuplicate(env, input)).rejects.toThrow(
-      'Semantic deduplication response contained an invalid result',
-    );
+    await expect(selectSemanticDuplicate(env, input)).rejects.toMatchObject({
+      message: 'Semantic deduplication response contained an invalid result',
+      retryable: true,
+    });
   });
 
   it('rejects malformed outer provider JSON with the canonical invalid-result error', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('not json', { status: 200 })));
 
-    await expect(selectSemanticDuplicate(env, input)).rejects.toThrow(
-      'Semantic deduplication response contained an invalid result',
-    );
+    await expect(selectSemanticDuplicate(env, input)).rejects.toMatchObject({
+      message: 'Semantic deduplication response contained an invalid result',
+      retryable: true,
+    });
   });
 
   it('keeps response-body timeout failures on the transport failure path', async () => {
@@ -156,17 +158,19 @@ describe('selectSemanticDuplicate', () => {
     });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
 
-    await expect(selectSemanticDuplicate(env, input)).rejects.toThrow(
-      'Semantic deduplication request failed: The response body timed out',
-    );
+    await expect(selectSemanticDuplicate(env, input)).rejects.toMatchObject({
+      message: 'Semantic deduplication request failed: The response body timed out',
+      retryable: true,
+    });
   });
 
   it('rejects a model-selected ref that was not supplied', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(responseWithResult({ duplicate_of: 'C99' })));
 
-    await expect(selectSemanticDuplicate(env, input)).rejects.toThrow(
-      'Semantic deduplication response contained an invalid result',
-    );
+    await expect(selectSemanticDuplicate(env, input)).rejects.toMatchObject({
+      message: 'Semantic deduplication response contained an invalid result',
+      retryable: true,
+    });
   });
 
   it('rejects non-whitelisted input fields before they can be sent', async () => {
@@ -189,6 +193,7 @@ describe('selectSemanticDuplicate', () => {
     await expect(selectSemanticDuplicate(env, unsafeInput)).rejects.toThrow(
       'Semantic deduplication input contained invalid data',
     );
+    await expect(selectSemanticDuplicate(env, unsafeInput)).rejects.not.toMatchObject({ retryable: true });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -200,8 +205,9 @@ describe('selectSemanticDuplicate', () => {
     await expect(selectSemanticDuplicate(env, input)).rejects.toMatchObject({
       name: 'UpstreamServiceError',
       status: 503,
+      retryable: true,
       message: 'Semantic deduplication request failed (503 Service Unavailable)',
-    } satisfies Partial<UpstreamServiceError>);
+    } satisfies Partial<UpstreamServiceError & RetryableDedupLlmError>);
   });
 
   it.each([
@@ -210,9 +216,10 @@ describe('selectSemanticDuplicate', () => {
   ])('keeps %s failures distinguishable from provider responses', async (_name, failure, message) => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(failure));
 
-    await expect(selectSemanticDuplicate(env, input)).rejects.toThrow(
-      `Semantic deduplication request failed: ${message}`,
-    );
+    await expect(selectSemanticDuplicate(env, input)).rejects.toMatchObject({
+      message: `Semantic deduplication request failed: ${message}`,
+      retryable: true,
+    });
   });
 
   it.each([
@@ -227,6 +234,7 @@ describe('selectSemanticDuplicate', () => {
 
     await expect(result).rejects.toBeInstanceOf(DedupLlmConfigurationError);
     await expect(result).rejects.toThrow(name);
+    await expect(result).rejects.toMatchObject({ retryable: true });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
