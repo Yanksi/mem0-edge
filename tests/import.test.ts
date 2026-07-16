@@ -176,6 +176,19 @@ function reclassificationDb(updatedRow?: {
   actorId: string | null;
   metadataJson: string;
 }) {
+  let source = {
+    id: 'source-memory',
+    userId: 'legacy-agent-user' as string | null,
+    agentId: null as string | null,
+    runId: 'run-1' as string | null,
+    actorId: 'actor-1' as string | null,
+    content: '  Exact raw memory.  ',
+    metadataJson: JSON.stringify({ source: 'mem0', ignoredNull: null, agent_id: 'spoofed' }),
+    hash: 'source-hash',
+    contentHash: null as string | null,
+    createdAt: 2,
+    deletedAt: null as number | null,
+  };
   const statements: Array<{ sql: string; bindings: unknown[] }> = [];
   const prepare = vi.fn((sql: string) => {
     const call = { sql, bindings: [] as unknown[] };
@@ -185,16 +198,37 @@ function reclassificationDb(updatedRow?: {
         call.bindings = bindings;
         return statement;
       }),
-      first: vi.fn(async () => (/UPDATE memories/i.test(sql) && /RETURNING/i.test(sql) ? updatedRow ?? null : null)),
+      first: vi.fn(async () => {
+        if (/SELECT id, user_id AS userId/i.test(sql) && /FROM memories/i.test(sql)) return source;
+        if (/SET content_hash = \?/i.test(sql) && /RETURNING/i.test(sql)) {
+          source = { ...source, contentHash: call.bindings[0] as string };
+          return source;
+        }
+        if (/SET user_id = NULL, agent_id = \?/i.test(sql) && /RETURNING/i.test(sql)) {
+          source = {
+            ...source,
+            userId: null,
+            agentId: call.bindings[0] as string,
+            contentHash: source.contentHash ?? call.bindings[1] as string,
+            ...(updatedRow ?? {}),
+          };
+          return source;
+        }
+        return null;
+      }),
+      all: vi.fn(async () => ({ success: true, results: [], meta: { changes: 0 } })),
       run: vi.fn(async () => ({ success: true, results: [], meta: { changes: 1 } })),
     };
     return statement;
   });
-  const batch = vi.fn(async (items: unknown[]) => items.map(() => ({
-    success: true,
-    results: [],
-    meta: { changes: 1 },
-  })));
+  const batch = vi.fn(async (items: unknown[]) => {
+    if (items.length === 3) source = { ...source, deletedAt: 1 };
+    return items.map(() => ({
+      success: true,
+      results: [],
+      meta: { changes: 1 },
+    }));
+  });
   return { prepare, batch, statements };
 }
 
@@ -936,7 +970,7 @@ describe('Mem0 agent reclassification', () => {
       digest,
       job.id,
     );
-    const update = db.statements.find(({ sql }) => /UPDATE memories/i.test(sql));
+    const update = db.statements.find(({ sql }) => /SET user_id = NULL, agent_id = \?/i.test(sql));
     expect(update?.sql).toMatch(/content_hash\s*=\s*COALESCE\(content_hash, \?\)/i);
     expect(update?.bindings).toEqual(expect.arrayContaining([
       'agent-1', digest, 'source-memory', 'legacy-agent-user',
@@ -986,17 +1020,22 @@ describe('Mem0 agent reclassification', () => {
       digest,
       job.id,
     );
-    expect(db.batch).toHaveBeenCalledTimes(2);
+    expect(db.batch).toHaveBeenCalledOnce();
     const [firstBatch] = db.batch.mock.calls[0];
     expect(firstBatch).toHaveLength(3);
-    const [copyLinks, rewireRelationships, softDeleteSource] = db.statements.slice(0, 3);
-    expect(copyLinks.sql).toMatch(/INSERT OR IGNORE INTO memory_entity_links[\s\S]*SELECT \?, entity_id, created_at[\s\S]*WHERE memory_id = \?/i);
-    expect(copyLinks.bindings).toEqual(['older-target', 'source-memory']);
+    const copyLinks = db.statements.find(({ sql }) => /INSERT OR IGNORE INTO memory_entity_links/i.test(sql))!;
+    const rewireRelationships = db.statements.find(({ sql }) => /UPDATE relationships/i.test(sql))!;
+    const softDeleteSource = db.statements.find(({ sql }) => /SET deleted_at = unixepoch\(\)/i.test(sql))!;
+    expect(copyLinks.sql).toMatch(/INSERT OR IGNORE INTO memory_entity_links[\s\S]*SELECT \?, links\.entity_id, links\.created_at[\s\S]*WHERE links\.memory_id = \?/i);
+    expect(copyLinks.bindings.slice(0, 2)).toEqual(['older-target', 'source-memory']);
+    expect(copyLinks.bindings).toEqual(expect.arrayContaining([
+      'source-memory', 'legacy-agent-user', 'source-hash', 'older-target', 'target-hash',
+    ]));
     expect(rewireRelationships.sql).toMatch(/UPDATE relationships\s+SET evidence_memory_id = \?\s+WHERE evidence_memory_id = \?/i);
-    expect(rewireRelationships.bindings).toEqual(['older-target', 'source-memory']);
-    expect(softDeleteSource.sql).toMatch(/UPDATE memories\s+SET deleted_at = unixepoch\(\)\s+WHERE id = \? AND deleted_at IS NULL/i);
-    expect(softDeleteSource.bindings).toEqual(['source-memory']);
-    expect(db.statements.some(({ sql, bindings }) => /UPDATE memories/i.test(sql) && bindings.includes('older-target'))).toBe(false);
+    expect(rewireRelationships.bindings.slice(0, 2)).toEqual(['older-target', 'source-memory']);
+    expect(softDeleteSource.sql).toMatch(/UPDATE memories\s+SET deleted_at = unixepoch\(\)\s+WHERE id = \?[\s\S]*guarded\.deleted_at IS NULL/i);
+    expect(softDeleteSource.bindings[0]).toBe('source-memory');
+    expect(softDeleteSource.bindings).toContain('older-target');
     expect(dependencies.deleteVector).toHaveBeenCalledTimes(2);
     expect(dependencies.deleteVector).toHaveBeenNthCalledWith(1, env.VECTORIZE, 'source-memory');
     expect(dependencies.embedText).not.toHaveBeenCalled();

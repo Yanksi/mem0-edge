@@ -2,6 +2,14 @@ import { and, eq, isNull, type SQL } from 'drizzle-orm';
 import { memories } from '../db/schema';
 import { sha256Hex } from './idempotency';
 
+const RESERVED_VECTOR_METADATA_KEYS = new Set([
+  'user_id',
+  'agent_id',
+  'run_id',
+  'actor_id',
+  'scope_key',
+]);
+
 export interface MemoryOwnerScope {
   userId: string | null;
   agentId: string | null;
@@ -46,8 +54,9 @@ function scalarMetadata(value: string): Record<string, VectorizeVectorMetadataVa
     const parsed: unknown = JSON.parse(value);
     if (!isRecord(parsed)) return {};
 
-    return Object.fromEntries(Object.entries(parsed).filter(([, item]) => (
-      typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean'
+    return Object.fromEntries(Object.entries(parsed).filter(([key, item]) => (
+      !RESERVED_VECTOR_METADATA_KEYS.has(key)
+      && (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean')
     ))) as Record<string, VectorizeVectorMetadataValue>;
   } catch {
     return {};

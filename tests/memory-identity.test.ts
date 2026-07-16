@@ -90,4 +90,26 @@ describe('memory identity', () => {
       scope_key: await scopeKey(scope),
     });
   });
+
+  it('removes reserved identity metadata when every authoritative owner column is null', async () => {
+    const row = {
+      userId: null,
+      agentId: null,
+      runId: null,
+      actorId: null,
+      metadataJson: JSON.stringify({
+        label: 'kept',
+        user_id: 'spoofed-user',
+        agent_id: 'spoofed-agent',
+        run_id: 'spoofed-run',
+        actor_id: 'spoofed-actor',
+        scope_key: 'spoofed-scope',
+      }),
+    };
+
+    await expect(memoryVectorMetadata(row)).resolves.toEqual({
+      label: 'kept',
+      scope_key: await scopeKey(row),
+    });
+  });
 });
