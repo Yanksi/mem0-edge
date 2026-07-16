@@ -38,7 +38,7 @@ export const memories = sqliteTable(
     content: text('content').notNull(),
     metadataJson: text('metadata_json').notNull().default('{}'),
     hash: text('hash').notNull(),
-    contentHash: text('content_hash'),
+    contentHash: text('content_hash').notNull(),
     createdAt,
     updatedAt,
     deletedAt: integer('deleted_at'),
@@ -50,6 +50,15 @@ export const memories = sqliteTable(
       table.deletedAt,
     ),
     index('memories_hash_idx').on(table.hash),
+    uniqueIndex('memories_active_user_agent_content_idx')
+      .on(table.userId, table.agentId, table.contentHash, table.content)
+      .where(sql`${table.deletedAt} IS NULL AND ${table.userId} IS NOT NULL AND ${table.agentId} IS NOT NULL`),
+    uniqueIndex('memories_active_user_content_idx')
+      .on(table.userId, table.contentHash, table.content)
+      .where(sql`${table.deletedAt} IS NULL AND ${table.userId} IS NOT NULL AND ${table.agentId} IS NULL`),
+    uniqueIndex('memories_active_agent_content_idx')
+      .on(table.agentId, table.contentHash, table.content)
+      .where(sql`${table.deletedAt} IS NULL AND ${table.userId} IS NULL AND ${table.agentId} IS NOT NULL`),
   ],
 );
 

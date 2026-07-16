@@ -18,7 +18,7 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deplo
 - Durable tenant-scoped idempotency records, retry-safe deterministic writes, and bounded Queue consumers for asynchronous ingestion and Mem0 imports.
 - Extracted entity and relationship persistence, plus read-only graph endpoints.
 - API-key authentication, per-user memory and graph isolation, and a signed-session operator dashboard with automatic user discovery.
-- Phase-one exact write-time matching, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
+- Exact write-time matching with final database-enforced exact uniqueness, optional semantic write-time deduplication, and a Dashboard switch for the semantic mode.
 - Dashboard views for semantic search, paginated active-memory browsing, a bounded user entity/relationship graph, and dashboard-managed user-ID aliases.
 - D1 migrations, local test coverage, Wrangler configuration, and a deployment guide.
 
@@ -28,7 +28,6 @@ Repository: [Yanksi/mem-worker](https://github.com/Yanksi/mem-worker). The Deplo
 - Hosted Mem0 Platform features such as organizations, billing, advanced user management, and hosted-dashboard parity.
 - Alternative vector stores, graph databases, or the broad LLM/embedder provider matrix from Mem0 OSS.
 - A Neo4j-style graph engine, unbounded graph traversal, advanced graph analytics, or agent-scoped graphs; graph support is bounded D1-backed storage and reads for user-scoped memories.
-- Final database-enforced exact uniqueness is pending production verification and the reviewed migration `0008`, which is intentionally absent from this branch.
 - Zero-touch Cloudflare setup without operator verification. The guided flow can provision supported resources, but operators must verify bindings and manually apply migrations, create metadata indexes, and set secrets.
 - A general-purpose job-status API or dashboard job monitor beyond the durable ingestion behavior used internally by async memory requests.
 - Dashboard memory editing, general deletion, bulk exports, graph editing, or graph traversal beyond the bounded read-only graph view; the dashboard can create, change, or remove display aliases for stored user IDs.
@@ -64,7 +63,7 @@ These four model paths are configured independently. Every key is a secret, and 
 
 ### Memory deduplication
 
-Phase-one exact matching runs on every write, but it is race-prone before migration `0008`: concurrent exact writes can both survive because no database uniqueness constraint serializes them. Each exact check uses the full (`user_id`, `agent_id`) scope, including every null/value combination, and compares raw memory text after the hash lookup, guarding against hash collisions. It does not depend on the semantic setting or an LLM. Concurrency-safe exact uniqueness begins only after production verification succeeds and the reviewed migration `0008` is created and applied.
+Exact matching runs on every write. Migration `0008` adds partial unique indexes for every supported owner scope, preventing concurrent exact writes from preserving two active copies once that migration is applied. Each exact check uses the full (`user_id`, `agent_id`) scope, including every null/value combination, and compares raw memory text after the hash lookup, guarding against hash collisions. It does not depend on the semantic setting or an LLM.
 
 Semantic write-time deduplication defaults to **off**. Enable it with the switch at `Dashboard > System settings` after configuring its dedicated endpoint, model, and key. Only new writes are checked semantically; existing memories are not semantically consolidated. A duplicate paraphrase discards the new write and leaves the older canonical memory unchanged. Contradictions, temporal or state changes, material additions, subsets, supersets, and uncertain matches remain distinct memories. Simultaneous paraphrased writes are not serialized, so both writes can survive.
 
@@ -198,7 +197,7 @@ The dashboard offers:
 - **Memory graph** displays a selected user's stored entities and relationships as a bounded interactive graph; it is unavailable for agent entities.
 - **Import from Mem0** queues a `RawMemoryMigrationExport` for a chosen user or agent target.
 
-The **System settings** view contains the semantic memory deduplication switch. Phase-one exact matching has no switch because it runs on every write, but it remains race-prone until migration `0008` adds database uniqueness. The old Dashboard cleanup control and endpoint no longer exist.
+The **System settings** view contains the semantic memory deduplication switch. Exact matching has no switch because it runs on every write; migration `0008` enforces concurrent exact uniqueness in D1. The old Dashboard cleanup control and endpoint no longer exist.
 
 The adjacent **Edit** control saves a dashboard-managed alias in D1. Once set, the selector displays the alias rather than the raw user ID; aliases do not alter API ownership, Hermes identities, or stored memory data. Apply the latest D1 migration after upgrading to create the alias table.
 
@@ -395,7 +394,7 @@ For an existing deployment, create all four independent model credentials before
 
 ### Existing-deployment deduplication maintenance
 
-Migration `0008` is intentionally not included in the repository yet. Keep the rollout in these production-gated phases:
+Migration `0008` is included, but existing deployments must not apply it before the production cleanup verifies successfully. Keep the rollout in these production-gated phases:
 
 1. Apply migration `0007_memory_deduplication_prepare.sql` only with `npx wrangler d1 migrations apply DB --remote`, then create and verify the string `scope_key` Vectorize metadata index.
 2. Deploy phase-one code with semantic deduplication still off.
@@ -404,10 +403,10 @@ Migration `0008` is intentionally not included in the repository yet. Keep the r
 5. Run `inspect`, review its report and backup, and record the exact backup path.
 6. Run `apply --confirm <inspection-artifact>` using that reviewed backup.
 7. Run `verify` and confirm that it succeeds in production.
-8. Only after successful production verification, create and apply migration `0008` while every writer remains paused. Review that migration before applying it with `npx wrangler d1 migrations apply DB --remote`.
+8. Only after successful production verification, review and apply migration `0008` while every writer remains paused, using `npx wrangler d1 migrations apply DB --remote`.
 9. Resume writers only after migration `0008` has been applied and post-migration checks succeed.
 
-Keep every writer paused from step 3 through step 8. Apply waits for Vectorize to process its last submitted mutation before reporting success; keep writers paused and investigate any barrier timeout or verification failure. Do not create migration `0008` based only on a local or staging result, and do not resume any ingress before it is reviewed and applied.
+Keep every writer paused from step 3 through step 8. Apply waits for Vectorize to process its last submitted mutation before reporting success; keep writers paused and investigate any barrier timeout or verification failure. Do not apply migration `0008` based only on a local or staging result, and do not resume any ingress before it is reviewed and applied.
 
 The package commands are:
 

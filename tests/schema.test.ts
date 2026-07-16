@@ -15,6 +15,8 @@ import reflectGraphIndexesMigration from '../src/migrations/0005_reflect_graph_i
 import mem0ImportRequestsMigration from '../src/migrations/0006_mem0_import_requests.sql?raw';
 // @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
 import memoryDeduplicationPrepareMigration from '../src/migrations/0007_memory_deduplication_prepare.sql?raw';
+// @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
+import memoryDeduplicationEnforceMigration from '../src/migrations/0008_memory_deduplication_enforce.sql?raw';
 import {
   apiKeys,
   entities,
@@ -296,9 +298,9 @@ describe('database schema', () => {
     );
   });
 
-  it('declares phase-one deduplication fields and service settings in Drizzle', () => {
+  it('declares final deduplication fields and service settings in Drizzle', () => {
     expect(memories.contentHash.name).toBe('content_hash');
-    expect(memories.contentHash.notNull).toBe(false);
+    expect(memories.contentHash.notNull).toBe(true);
     expect(memoryRequests.cleanupVectorIdsJson.name).toBe('cleanup_vector_ids_json');
     expect(memoryRequests.cleanupVectorIdsJson.notNull).toBe(false);
     expect(mem0ImportRequests.cleanupVectorId.name).toBe('cleanup_vector_id');
@@ -313,5 +315,34 @@ describe('database schema', () => {
     expect(serviceSettings.semanticDedupEnabled.default).toBe(false);
     expect(serviceSettings.updatedAt.name).toBe('updated_at');
     expect(serviceSettings.updatedAt.notNull).toBe(true);
+  });
+
+  it('enforces exact active-memory uniqueness in migration 0008 and Drizzle', () => {
+    const migration = normalizeLineEndings(memoryDeduplicationEnforceMigration);
+    const indexes = getTableConfig(memories).indexes.map((index) => index.config);
+
+    expect(migration).toContain('content_hash TEXT NOT NULL');
+    expect(migration).toContain('CREATE TABLE memory_history_rebuild (');
+    expect(migration).toContain('CREATE TABLE relationships_rebuild (');
+    expect(migration).toContain('CREATE TABLE memory_entity_links_rebuild (');
+    expect(migration).not.toContain('memories_active_user_agent_content_hash_lookup_idx');
+    expect(migration).not.toContain('memories_active_user_content_hash_lookup_idx');
+    expect(migration).not.toContain('memories_active_agent_content_hash_lookup_idx');
+    expect(migration).toContain(
+      'CREATE UNIQUE INDEX memories_active_user_agent_content_idx\n  ON memories (user_id, agent_id, content_hash, content)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NOT NULL;',
+    );
+    expect(migration).toContain(
+      'CREATE UNIQUE INDEX memories_active_user_content_idx\n  ON memories (user_id, content_hash, content)\n  WHERE deleted_at IS NULL AND user_id IS NOT NULL AND agent_id IS NULL;',
+    );
+    expect(migration).toContain(
+      'CREATE UNIQUE INDEX memories_active_agent_content_idx\n  ON memories (agent_id, content_hash, content)\n  WHERE deleted_at IS NULL AND user_id IS NULL AND agent_id IS NOT NULL;',
+    );
+    for (const name of [
+      'memories_active_user_agent_content_idx',
+      'memories_active_user_content_idx',
+      'memories_active_agent_content_idx',
+    ]) {
+      expect(indexes).toContainEqual(expect.objectContaining({ name, unique: true }));
+    }
   });
 });

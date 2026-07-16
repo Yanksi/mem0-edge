@@ -118,8 +118,9 @@ describe('semantic deduplication documentation', () => {
 
   it('keeps repository and write-time behavior accurate', () => {
     expect(readme).toContain('https://github.com/Yanksi/mem-worker');
-    expect(readme).toContain('Phase-one exact matching runs on every write, but it is race-prone before migration `0008`');
-    expect(readme).toContain('Concurrency-safe exact uniqueness begins only after production verification succeeds and the reviewed migration `0008` is created and applied.');
+    expect(readme).toContain('Exact matching runs on every write.');
+    expect(readme).toContain('Migration `0008` adds partial unique indexes for every supported owner scope');
+    expect(readme).toContain('preventing concurrent exact writes from preserving two active copies');
     expect(readme).toContain('full (`user_id`, `agent_id`) scope, including every null/value combination');
     expect(readme).toContain('raw memory text after the hash lookup, guarding against hash collisions');
     expect(readme).toContain('Semantic write-time deduplication defaults to **off**.');
@@ -225,11 +226,11 @@ describe('semantic deduplication documentation', () => {
     const inspect = readme.indexOf('Run `inspect`, review its report and backup, and record the exact backup path.');
     const apply = readme.indexOf('Run `apply --confirm <inspection-artifact>` using that reviewed backup.');
     const verify = readme.indexOf('Run `verify` and confirm that it succeeds in production.');
-    const create0008 = readme.indexOf('Only after successful production verification, create and apply migration `0008`');
+    const apply0008 = readme.indexOf('Only after successful production verification, review and apply migration `0008`');
     const resume = readme.indexOf('Resume writers only after migration `0008` has been applied');
 
     expect([
-      apply0007, scopeKey, deploy, pause, drain, inspect, apply, verify, create0008, resume,
+      apply0007, scopeKey, deploy, pause, drain, inspect, apply, verify, apply0008, resume,
     ].every((index) => index >= 0)).toBe(true);
     expect(apply0007).toBeLessThan(scopeKey);
     expect(scopeKey).toBeLessThan(deploy);
@@ -238,8 +239,8 @@ describe('semantic deduplication documentation', () => {
     expect(drain).toBeLessThan(inspect);
     expect(inspect).toBeLessThan(apply);
     expect(apply).toBeLessThan(verify);
-    expect(verify).toBeLessThan(create0008);
-    expect(create0008).toBeLessThan(resume);
+    expect(verify).toBeLessThan(apply0008);
+    expect(apply0008).toBeLessThan(resume);
   });
 
   it('keeps the implementation plan pause boundary aligned with the rollout', () => {
@@ -274,12 +275,14 @@ describe('semantic deduplication documentation', () => {
     expect(implementationPlan).toContain('artifact schema');
   });
 
-  it('asserts migration 0008 is not in the phase-one inventory', () => {
+  it('includes the production-gated final uniqueness migration', () => {
     expect(migrationFiles).toContain('../src/migrations/0007_memory_deduplication_prepare.sql');
-    expect(migrationFiles.filter((path) => /\/0008[^/]*\.sql$/.test(path))).toEqual([]);
+    expect(migrationFiles.filter((path) => /\/0008[^/]*\.sql$/.test(path))).toEqual([
+      '../src/migrations/0008_memory_deduplication_enforce.sql',
+    ]);
   });
 
-  it('does not present pending database uniqueness as included before migration 0008 exists', () => {
+  it('presents final database uniqueness as included once migration 0008 exists', () => {
     const hasMigration0008 = migrationFiles.some((path) => /\/0008[^/]*\.sql$/.test(path));
     const includedStart = readme.indexOf('## Included');
     const notIncludedStart = readme.indexOf('## Not Included');
@@ -292,11 +295,9 @@ describe('semantic deduplication documentation', () => {
     const included = readme.slice(includedStart, notIncludedStart);
     const notIncluded = readme.slice(notIncludedStart, notIncludedEnd);
 
-    expect(hasMigration0008).toBe(false);
-    if (!hasMigration0008) {
-      expect(included).not.toMatch(/final database-enforced exact uniqueness/i);
-      expect(notIncluded).toContain('Final database-enforced exact uniqueness is pending production verification and the reviewed migration `0008`');
-    }
+    expect(hasMigration0008).toBe(true);
+    expect(included).toMatch(/final database-enforced exact uniqueness/i);
+    expect(notIncluded).not.toMatch(/final database-enforced exact uniqueness/i);
   });
 
   it('does not describe the removed manual cleanup control or API', () => {
