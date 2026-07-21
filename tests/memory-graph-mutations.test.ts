@@ -237,6 +237,33 @@ describe('memory graph reconciliation', () => {
     expect(dependencies.upsertVectors).not.toHaveBeenCalled();
   });
 
+  it('does not delete the active vector when metadata CAS wins after D1 commit', async () => {
+    let releaseVector!: () => void;
+    dependencies.upsertVectors.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseVector = resolve;
+    }));
+    const contentUpdate = updateMemory(testEnv(), 'memory-1', 'user-1', { memory: 'Late content' });
+    await vi.waitFor(async () => {
+      expect(await db.prepare('SELECT status FROM memory_update_mutations').first())
+        .toEqual({ status: 'd1_committed' });
+      expect(dependencies.upsertVectors).toHaveBeenCalledTimes(1);
+    });
+
+    await expect(updateMemory(testEnv(), 'memory-1', 'user-1', { metadata: { source: 'dashboard' } }))
+      .resolves.toEqual(expect.objectContaining({
+        memory: 'Late content',
+        metadata: { source: 'dashboard' },
+      }));
+    releaseVector();
+
+    await expect(contentUpdate).rejects.toBeInstanceOf(MemoryMutationConflictError);
+    expect(dependencies.deleteVector).not.toHaveBeenCalledWith(memoryIndex, 'memory-1');
+    expect(await db.prepare('SELECT content, metadata_json, deleted_at FROM memories WHERE id = ?').bind('memory-1').first())
+      .toEqual({ content: 'Late content', metadata_json: '{"source":"dashboard"}', deleted_at: null });
+    expect(await db.prepare('SELECT status FROM memory_update_mutations').first())
+      .toEqual({ status: 'superseded' });
+  });
+
   it('dispatches an interrupted durable mutation by stable mutation ID', async () => {
     dependencies.extractMemoryGraph.mockRejectedValueOnce(new Error('extraction unavailable'));
     await expect(updateMemory(testEnv(), 'memory-1', 'user-1', { memory: 'Queued target' }))

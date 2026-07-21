@@ -339,7 +339,12 @@ async function completeOrCleanMutation(env: Env, mutation: MutationRow): Promise
     await env.DB.prepare(`UPDATE memory_update_mutations SET status = 'completed', completed_at = unixepoch(), updated_at = unixepoch() WHERE mutation_id = ? AND status = 'vectors_committed'`).bind(mutation.mutation_id).run();
     return;
   }
-  await deleteVector(env.VECTORIZE, mutation.memory_id);
+  const targetIsStillActive = memory !== null
+    && memory.deletedAt === null
+    && memory.userId === mutation.user_id
+    && memory.content === mutation.target_content
+    && memory.contentHash === mutation.target_content_hash;
+  if (!targetIsStillActive) await deleteVector(env.VECTORIZE, mutation.memory_id);
   await env.DB.prepare(`UPDATE memory_update_mutations SET status = 'superseded', completed_at = unixepoch(), updated_at = unixepoch() WHERE mutation_id = ? AND status = 'vectors_committed'`).bind(mutation.mutation_id).run();
 }
 
