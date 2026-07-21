@@ -3,6 +3,7 @@ import type { Env } from '../src/env';
 import { GraphReflectionInputSchema, GraphReflectionResultSchema, ReflectRequestSchema } from '../src/reflect/types';
 import {
   embedText,
+  extractMemoryGraph,
   extractMemories,
   GRAPH_REFLECTION_INSTRUCTION,
   GraphLlmConfigurationError,
@@ -177,6 +178,41 @@ describe('extractMemories', () => {
 
     vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'not json' } }] }), { status: 200 })));
     await expect(extractMemories(env, request)).rejects.toThrow('OpenAI memory extraction response contained invalid JSON');
+  });
+});
+
+describe('extractMemoryGraph', () => {
+  it('extracts graph records without allowing the model to rewrite the memory', async () => {
+    const graph = {
+      entities: [
+        { name: 'Ada', type: 'person' },
+        { name: 'Chandra', type: 'person' },
+      ],
+      relationships: [{ source: 'Ada', target: 'Chandra', relation_type: 'reports_to', confidence: 0.9 }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(graph) } }] }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(extractMemoryGraph(env, 'Ada reports to Chandra.')).resolves.toEqual(graph);
+    const requestBody = JSON.parse(fetchMock.mock.calls[0][1].body as string) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(requestBody.messages[1]).toEqual({ role: 'user', content: 'Ada reports to Chandra.' });
+    expect(requestBody.messages[0].content).toContain('Do not rewrite, split, merge, or add facts');
+  });
+
+  it('rejects malformed graph extraction output', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        entities: [],
+        relationships: [{ source: 'Ada', target: 'Chandra', relationship: 'reports_to' }],
+      }) } }] }), { status: 200 }),
+    ));
+
+    await expect(extractMemoryGraph(env, 'Ada reports to Chandra.'))
+      .rejects.toThrow('OpenAI graph extraction response contained an invalid graph');
   });
 });
 

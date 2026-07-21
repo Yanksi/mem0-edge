@@ -3,7 +3,7 @@ import { nanoid } from 'nanoid';
 import { createDb } from '../db/client';
 import { entities, memories, memoryEntityLinks, memoryHistory, memoryRequests, relationships } from '../db/schema';
 import type { Env, MemoryJob } from '../env';
-import { embedText, extractMemories } from '../llm';
+import { embedText, extractMemories, extractMemoryGraph } from '../llm';
 import type { ExtractedEntity, ExtractedMemory, ExtractedRelationship } from '../llm';
 import { deleteVector, searchEntityVectors, searchVectors, upsertEntityVectors, upsertVectors } from '../vectorize';
 import { findActiveExactMemory, prepareMemoryWrite } from './deduplication';
@@ -729,6 +729,13 @@ export async function getMemoryById(env: Env, id: string): Promise<MemoryRespons
   return row === undefined ? null : toResponse(row);
 }
 
+export async function getMemoryOwnerById(env: Env, id: string): Promise<string | null | undefined> {
+  const row = await createDb(env.DB).select({ userId: memories.userId }).from(memories).where(
+    eq(memories.id, id),
+  ).get();
+  return row?.userId;
+}
+
 export async function listMemories(env: Env, userId: string, limit: number): Promise<MemoryResponse[]> {
   const rows = await createDb(env.DB).select().from(memories).where(and(
     eq(memories.userId, userId),
@@ -764,6 +771,9 @@ export async function updateMemory(env: Env, id: string, userId: string, request
     metadataJson: JSON.stringify(metadata),
     updatedAt: now,
   };
+  const graph = request.memory === undefined
+    ? undefined
+    : await extractMemoryGraph(env, content);
 
   try {
     await db.update(memories).set({
@@ -777,6 +787,11 @@ export async function updateMemory(env: Env, id: string, userId: string, request
       throw new MemoryContentConflictError();
     }
     throw error;
+  }
+
+  if (graph !== undefined) {
+    await removeMemoryGraph(db, id);
+    await persistExtractedGraph(db, env, next, { memory: content, ...graph });
   }
 
   const vector = await embedText(env, content);
@@ -804,14 +819,34 @@ function isMemoryContentUniqueConstraintError(error: unknown): boolean {
 
 export async function deleteMemory(env: Env, id: string, userId: string): Promise<boolean> {
   const db = createDb(env.DB);
-  const current = await findActiveMemory(env, id, userId, db);
+  const current = await findOwnedMemory(id, userId, db);
   if (current === undefined) return false;
 
+  if (current.deletedAt === null) {
+    const deletedAt = unixNow();
+    await db.update(memories).set({ deletedAt }).where(and(
+      eq(memories.id, id), eq(memories.userId, userId), isNull(memories.deletedAt),
+    )).run();
+  }
+  await removeMemoryGraph(db, id);
+  await appendHistory(db, current, 'deleted', await deterministicDeletedHistoryId(id));
   await deleteVector(env.VECTORIZE, id);
-  const deletedAt = unixNow();
-  await db.update(memories).set({ deletedAt }).where(eq(memories.id, id)).run();
-  await appendHistory(db, current, 'deleted');
   return true;
+}
+
+async function removeMemoryGraph(db: ReturnType<typeof createDb>, memoryId: string): Promise<void> {
+  await db.delete(relationships).where(eq(relationships.evidenceMemoryId, memoryId)).run();
+  await db.delete(memoryEntityLinks).where(eq(memoryEntityLinks.memoryId, memoryId)).run();
+}
+
+async function findOwnedMemory(
+  id: string,
+  userId: string,
+  db: ReturnType<typeof createDb>,
+): Promise<MemoryRow | undefined> {
+  return db.select().from(memories).where(and(
+    eq(memories.id, id), eq(memories.userId, userId),
+  )).get();
 }
 
 async function findActiveMemory(
@@ -850,6 +885,10 @@ function deterministicMemoryId(userId: string, hash: string, candidateIndex: num
 
 function deterministicCreatedHistoryId(memoryId: string): Promise<string> {
   return sha256Hex(`memory-history:${memoryId}:created`);
+}
+
+function deterministicDeletedHistoryId(memoryId: string): Promise<string> {
+  return sha256Hex(`memory-history:${memoryId}:deleted`);
 }
 
 function toResponse(row: MemoryRow): MemoryResponse {

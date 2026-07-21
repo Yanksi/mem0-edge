@@ -6,6 +6,7 @@ import {
   addMemory,
   deleteMemory,
   getMemoryById,
+  getMemoryOwnerById,
   MemoryContentConflictError,
   searchMemories,
   updateMemory,
@@ -54,9 +55,15 @@ hermesRoutes.put('/memories/:id', async (context) => {
 
 hermesRoutes.delete('/memories/:id', async (context) => {
   const memory = await getMemoryById(context.env, context.req.param('id'));
-  if (memory === null) return notFound(context);
-  if (memory.user_id === undefined) return context.json({ error: 'Memory is not user-scoped' }, 409);
-  const deleted = await deleteMemory(context.env, memory.id, memory.user_id);
+  const storedOwner = memory === null
+    ? await getMemoryOwnerById(context.env, context.req.param('id'))
+    : memory?.user_id;
+  if (memory === null && storedOwner === undefined) return notFound(context);
+  if (storedOwner === null || (memory !== null && memory !== undefined && memory.user_id === undefined)) {
+    return context.json({ error: 'Memory is not user-scoped' }, 409);
+  }
+  if (storedOwner === undefined) return notFound(context);
+  const deleted = await deleteMemory(context.env, context.req.param('id'), storedOwner);
   return deleted ? context.json({ deleted: true }) : notFound(context);
 });
 

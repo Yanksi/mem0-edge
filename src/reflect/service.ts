@@ -89,14 +89,19 @@ export async function reflectMemories(env: Env, request: ReflectRequest, request
   const evidenceCandidates = await collectEvidenceCandidates(
     db, request.user_id, seeds, accepted, [...byId.keys()],
   );
+  const activeEvidenceIds = new Set(evidenceCandidates.map(({ id }) => id));
+  const supportedEdges = accepted.filter((edge) => (
+    edge.evidenceMemoryId === null || activeEvidenceIds.has(edge.evidenceMemoryId)
+  ));
+  if (supportedEdges.length === 0) return noEvidence(requestId);
 
   const orderedEntities = [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
   const entityRefs = new Map(orderedEntities.map((entity, index) => [entity.id, `E${index + 1}`]));
-  const relationRefs = new Map(accepted.map((edge, index) => [edge.id, `R${index + 1}`]));
+  const relationRefs = new Map(supportedEdges.map((edge, index) => [edge.id, `R${index + 1}`]));
   const reflection = await reflectWithGraphModel(env, {
     query: request.query,
     entities: orderedEntities.map((entity) => ({ ref: entityRefs.get(entity.id)!, name: entity.name, type: entity.type })),
-    relations: accepted.map((edge) => ({
+    relations: supportedEdges.map((edge) => ({
       ref: relationRefs.get(edge.id)!, source: entityRefs.get(edge.sourceEntityId)!, predicate: edge.relationType,
       target: entityRefs.get(edge.targetEntityId)!, ...(edge.confidence === null ? {} : { confidence: edge.confidence }),
     })),
@@ -104,7 +109,7 @@ export async function reflectMemories(env: Env, request: ReflectRequest, request
 
   const selectedRefs = reflection.evidence_relation_refs;
   if (selectedRefs.length === 0 || new Set(selectedRefs).size !== selectedRefs.length) return noEvidence(requestId);
-  const byRef = new Map(accepted.map((edge) => [relationRefs.get(edge.id)!, edge]));
+  const byRef = new Map(supportedEdges.map((edge) => [relationRefs.get(edge.id)!, edge]));
   const selected = selectedRefs.map((ref) => byRef.get(ref));
   if (selected.some((edge) => edge === undefined)) return noEvidence(requestId);
 

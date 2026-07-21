@@ -7,6 +7,7 @@ import {
   deleteMemory,
   getMemory,
   getMemoryById,
+  getMemoryOwnerById,
   listMemories,
   MemoryContentConflictError,
   searchMemories,
@@ -74,8 +75,13 @@ memoriesRoutes.delete('/:id', async (context) => {
   const requestedUserId = context.req.query('user_id');
   if (requestedUserId !== undefined && requestedUserId.trim() === '') return validationError();
   const memory = requestedUserId === undefined ? await getMemoryById(context.env, context.req.param('id')) : null;
+  const storedOwner = requestedUserId === undefined && memory === null
+    ? await getMemoryOwnerById(context.env, context.req.param('id'))
+    : memory?.user_id;
   if (memory !== null && memory !== undefined && memory.user_id === undefined) return context.json({ error: 'Memory is not user-scoped' }, 409);
-  const userId = requestedUserId ?? memory?.user_id;
+  if (memory === null && storedOwner === null) return context.json({ error: 'Memory is not user-scoped' }, 409);
+  const userId = requestedUserId ?? storedOwner;
+  if (userId === null) return context.json({ error: 'Memory is not user-scoped' }, 409);
   if (userId === undefined) return memory === null ? notFound(context) : validationError();
   const deleted = await deleteMemory(context.env, context.req.param('id'), userId);
   return deleted ? context.json({ deleted: true }) : notFound(context);

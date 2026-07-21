@@ -230,6 +230,28 @@ describe('reflectMemories', () => {
       relationshipRows[1] = { ...relationshipRows[1], evidenceMemoryId: 'memory-benoit' };
     }
   });
+
+  it('drops stale relationships before the graph model while preserving valid evidence', async () => {
+    relationshipRows[0] = { ...relationshipRows[0], evidenceMemoryId: 'memory-deleted' };
+    dependencies.reflectWithGraphModel.mockResolvedValue({
+      result: 'Chandra manages Benoit.', evidence_relation_refs: ['R1'],
+    });
+    try {
+      const result = await reflectMemories(env, {
+        query: 'Who manages Benoit?', user_id: 'user-a', agent_id: 'agent-a',
+      }, 'request-partial-stale');
+
+      expect(dependencies.reflectWithGraphModel).toHaveBeenCalledWith(env, expect.objectContaining({
+        relations: [{ ref: 'R1', source: 'E2', predicate: 'managed_by', target: 'E3', confidence: 0.8 }],
+      }));
+      expect(result).toMatchObject({
+        uncertainty: 'medium',
+        evidences: [{ relationship: expect.objectContaining({ id: 'relationship-benoit' }) }],
+      });
+    } finally {
+      relationshipRows[0] = { ...relationshipRows[0], evidenceMemoryId: 'memory-ada' };
+    }
+  });
 });
 
 describe('graph reflection deployment documentation', () => {

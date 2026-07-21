@@ -7,6 +7,7 @@ const dependencies = vi.hoisted(() => ({
   createDb: vi.fn(),
   embedText: vi.fn(),
   extractMemories: vi.fn(),
+  extractMemoryGraph: vi.fn(),
   upsertVectors: vi.fn(),
   upsertEntityVectors: vi.fn(),
   deleteVector: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('../src/db/client', () => ({ createDb: dependencies.createDb }));
 vi.mock('../src/llm', () => ({
   embedText: dependencies.embedText,
   extractMemories: dependencies.extractMemories,
+  extractMemoryGraph: dependencies.extractMemoryGraph,
 }));
 vi.mock('../src/vectorize', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/vectorize')>(),
@@ -42,6 +44,7 @@ const service = vi.hoisted(() => {
     listMemories: vi.fn(),
     getMemory: vi.fn(),
     getMemoryById: vi.fn(),
+    getMemoryOwnerById: vi.fn(),
     updateMemory: vi.fn(),
     deleteMemory: vi.fn(),
     MemoryContentConflictError,
@@ -915,6 +918,7 @@ function createUpdateDb(
   const updateErrors = [...(options.updateErrors ?? [])];
   const updateValues: Array<Record<string, unknown>> = [];
   const historyValues: Array<Record<string, unknown>> = [];
+  const deleteRun = vi.fn().mockResolvedValue({});
   let pendingUpdate: Record<string, unknown> | undefined;
   const updateRun = vi.fn(async () => {
     const error = updateErrors.shift();
@@ -933,6 +937,7 @@ function createUpdateDb(
         return { where: vi.fn().mockReturnValue({ run: updateRun }) };
       }),
     })),
+    delete: vi.fn(() => ({ where: vi.fn().mockReturnValue({ run: deleteRun }) })),
     insert: vi.fn(() => ({
       values: vi.fn((values: Record<string, unknown>) => {
         historyValues.push(values);
@@ -948,6 +953,7 @@ describe('updateMemory deduplication', () => {
     vi.clearAllMocks();
     dependencies.findActiveExactMemory.mockResolvedValue(undefined);
     dependencies.embedText.mockResolvedValue([0.8, 0.9]);
+    dependencies.extractMemoryGraph.mockResolvedValue({ entities: [], relationships: [] });
     dependencies.upsertVectors.mockResolvedValue(undefined);
   });
 
@@ -1394,6 +1400,21 @@ describe('Hermes self-hosted compatibility routes', () => {
     });
     expect(service.deleteMemory).toHaveBeenCalledWith(env, 'memory-123', 'user-123');
   });
+
+  it.each(['/memories/memory-123', '/v1/memories/memory-123'])(
+    'resolves a soft-deleted owner so DELETE %s can retry vector cleanup', async (path) => {
+    service.getMemoryById.mockResolvedValue(null);
+    service.getMemoryOwnerById.mockResolvedValue('user-123');
+    service.deleteMemory.mockResolvedValue(true);
+
+    const deleted = await worker.fetch(request(path, {
+      method: 'DELETE', headers: { 'X-API-Key': 'test-api-key' },
+    }), env);
+
+    expect(deleted.status).toBe(200);
+    expect(service.deleteMemory).toHaveBeenCalledWith(env, 'memory-123', 'user-123');
+    },
+  );
 
   it.each(['/memories/memory-123', '/v1/memories/memory-123'])(
     'returns the memory content conflict response for Hermes PUT %s',
