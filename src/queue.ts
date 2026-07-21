@@ -1,6 +1,7 @@
 import type { Env, MemoryJob } from './env';
 import { isMem0ImportJob, isReclassifyMem0AgentJob, processMem0AgentReclassificationJob, processMem0ImportJob } from './import/service';
 import { processMemoryJob, TransientMemoryJobError } from './memory/service';
+import { isUpdateMemoryJob, processMemoryUpdateMutation } from './memory/update-mutations';
 import { AddMemoryRequestSchema } from './memory/types';
 
 function isMemoryJob(value: unknown): value is MemoryJob {
@@ -17,6 +18,17 @@ export async function handleMemoryQueue(batch: MessageBatch<MemoryJob>, env: Env
 }
 
 async function handleMemoryMessage(message: Message<MemoryJob>, env: Env): Promise<void> {
+  if (isUpdateMemoryJob(message.body)) {
+    try {
+      await processMemoryUpdateMutation(env, message.body.mutationId);
+      message.ack();
+    } catch (error) {
+      if (isTransientQueueError(error)) return retryWithBackoff(message);
+      message.ack();
+    }
+    return;
+  }
+
   if (isMem0ImportJob(message.body)) {
     try {
       const result = await processMem0ImportJob(env, message.body);

@@ -15,7 +15,8 @@ phase, lease and dispatch state. Prepared vector payloads live in
 `memory_update_vector_intents`, one row per target index/vector ID. Model output is
 therefore generated once and replayed byte-for-byte.
 
-`memories.mutation_version` is a monotonic optimistic-concurrency token. The D1
+`memories.mutation_version` is a monotonic optimistic-concurrency token and
+`last_mutation_id` fences operations that calculate the same target version. The D1
 commit is one guarded batch: compare-and-swap the memory row, replace its graph,
 insert deterministic history, and advance the ledger. Every statement is guarded
 by owner, active state, and target version, so a failed CAS cannot mutate graph or

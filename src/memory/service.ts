@@ -16,6 +16,13 @@ import type {
   SearchMemoryRequest,
   UpdateMemoryRequest,
 } from './types';
+import {
+  DurableMemoryMutationError,
+  executeContentUpdate,
+  MemoryMutationConflictError,
+} from './update-mutations';
+
+export { DurableMemoryMutationError, MemoryMutationConflictError } from './update-mutations';
 
 type MemoryRow = typeof memories.$inferSelect;
 type MemoryRequestRow = typeof memoryRequests.$inferSelect;
@@ -771,33 +778,31 @@ export async function updateMemory(env: Env, id: string, userId: string, request
     metadataJson: JSON.stringify(metadata),
     updatedAt: now,
   };
-  const graph = request.memory === undefined
-    ? undefined
-    : await extractMemoryGraph(env, content);
-
-  try {
-    await db.update(memories).set({
-      content,
-      contentHash: next.contentHash,
-      metadataJson: next.metadataJson,
-      updatedAt: now,
-    }).where(eq(memories.id, id)).run();
-  } catch (error) {
-    if (content !== current.content && isMemoryContentUniqueConstraintError(error)) {
-      throw new MemoryContentConflictError();
+  if (request.memory !== undefined) {
+    try {
+      return toResponse(await executeContentUpdate(env, current, {
+        content, contentHash: next.contentHash, metadataJson: next.metadataJson, updatedAt: now,
+      }));
+    } catch (error) {
+      if (isMemoryContentUniqueConstraintError(error)) throw new MemoryContentConflictError();
+      throw error;
     }
-    throw error;
   }
 
-  if (graph !== undefined) {
-    await removeMemoryGraph(db, id);
-    await persistExtractedGraph(db, env, next, { memory: content, ...graph });
+  const targetVersion = current.mutationVersion + 1;
+  const historyId = await sha256Hex(`memory-history:${id}:updated:${targetVersion}`);
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE memories SET metadata_json = ?, updated_at = ?, mutation_version = ?, last_mutation_id = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL AND mutation_version = ?`)
+      .bind(next.metadataJson, now, targetVersion, historyId, id, userId, current.mutationVersion),
+    env.DB.prepare(`INSERT INTO memory_history (id, memory_id, operation, content, metadata_json, hash, created_at) SELECT ?, id, 'updated', content, metadata_json, hash, unixepoch() FROM memories WHERE id = ? AND user_id = ? AND deleted_at IS NULL AND mutation_version = ? AND last_mutation_id = ? ON CONFLICT(id) DO NOTHING`)
+      .bind(historyId, id, userId, targetVersion, historyId),
+  ]);
+  const fence = await env.DB.prepare('SELECT last_mutation_id FROM memories WHERE id = ?').bind(id).first<{ last_mutation_id: string | null }>();
+  const stored = await findActiveMemory(env, id, userId, db);
+  if (fence?.last_mutation_id !== historyId || stored === undefined || stored.mutationVersion !== targetVersion || stored.metadataJson !== next.metadataJson) {
+    throw new MemoryMutationConflictError();
   }
-
-  const vector = await embedText(env, content);
-  await upsertVectors(env.VECTORIZE, [{ id, values: vector, metadata: await memoryVectorMetadata(next) }]);
-  await appendHistory(db, next, 'updated');
-  return toResponse(next);
+  return toResponse(stored);
 }
 
 function isMemoryContentUniqueConstraintError(error: unknown): boolean {
@@ -824,9 +829,17 @@ export async function deleteMemory(env: Env, id: string, userId: string): Promis
 
   if (current.deletedAt === null) {
     const deletedAt = unixNow();
-    await db.update(memories).set({ deletedAt }).where(and(
+    const deleted = await db.update(memories).set({
+      deletedAt,
+      mutationVersion: current.mutationVersion + 1,
+    }).where(and(
       eq(memories.id, id), eq(memories.userId, userId), isNull(memories.deletedAt),
-    )).run();
+      eq(memories.mutationVersion, current.mutationVersion),
+    )).returning({ id: memories.id }).all();
+    if (deleted.length === 0) {
+      const raced = await findOwnedMemory(id, userId, db);
+      if (raced?.deletedAt === null) throw new MemoryMutationConflictError('Memory changed while delete was committing');
+    }
   }
   await removeMemoryGraph(db, id);
   await appendHistory(db, current, 'deleted', await deterministicDeletedHistoryId(id));

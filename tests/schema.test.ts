@@ -17,6 +17,8 @@ import mem0ImportRequestsMigration from '../src/migrations/0006_mem0_import_requ
 import memoryDeduplicationPrepareMigration from '../src/migrations/0007_memory_deduplication_prepare.sql?raw';
 // @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
 import memoryDeduplicationEnforceMigration from '../src/migrations/0008_memory_deduplication_enforce.sql?raw';
+// @ts-expect-error -- this scaffold does not include Vite's client asset declarations.
+import memoryUpdateMutationsMigration from '../src/migrations/0009_memory_update_mutations.sql?raw';
 import {
   apiKeys,
   entities,
@@ -25,6 +27,8 @@ import {
   memoryRequests,
   memoryEntityLinks,
   memoryHistory,
+  memoryUpdateMutations,
+  memoryUpdateVectorIntents,
   relationships,
   serviceSettings,
 } from '../src/db/schema';
@@ -344,5 +348,35 @@ describe('database schema', () => {
     ]) {
       expect(indexes).toContainEqual(expect.objectContaining({ name, unique: true }));
     }
+  });
+
+  it('declares recoverable versioned memory update mutations in migration 0009 and Drizzle', () => {
+    expect(memories.mutationVersion.name).toBe('mutation_version');
+    expect(memories.mutationVersion.default).toBe(0);
+    expect(memories.lastMutationId.name).toBe('last_mutation_id');
+    expect(memoryUpdateMutations.mutationId.primary).toBe(true);
+    expect(memoryUpdateMutations.memoryId.name).toBe('memory_id');
+    expect(memoryUpdateMutations.baseVersion.name).toBe('base_version');
+    expect(memoryUpdateMutations.leaseExpiresAt.name).toBe('lease_expires_at');
+    expect(memoryUpdateVectorIntents.mutationId.name).toBe('mutation_id');
+    expect(memoryUpdateVectorIntents.indexKind.name).toBe('index_kind');
+    expect(memoryUpdateMutations.status.notNull).toBe(true);
+
+    const mutationIndexes = getTableConfig(memoryUpdateMutations).indexes.map((index) => index.config);
+    expect(mutationIndexes).toContainEqual(expect.objectContaining({
+      name: 'memory_update_mutations_dispatch_idx', unique: false,
+    }));
+    expect(mutationIndexes).toContainEqual(expect.objectContaining({
+      name: 'memory_update_mutations_active_memory_idx', unique: true,
+    }));
+
+    expect(memoryUpdateMutationsMigration).toContain(
+      'ALTER TABLE memories ADD COLUMN mutation_version INTEGER NOT NULL DEFAULT 0;',
+    );
+    expect(memoryUpdateMutationsMigration).toContain('ALTER TABLE memories ADD COLUMN last_mutation_id TEXT;');
+    expect(memoryUpdateMutationsMigration).toContain('CREATE TABLE memory_update_mutations (');
+    expect(memoryUpdateMutationsMigration).toContain('CREATE TABLE memory_update_vector_intents (');
+    expect(memoryUpdateMutationsMigration).toContain('CREATE UNIQUE INDEX memory_update_mutations_active_memory_idx');
+    expect(memoryUpdateMutationsMigration).toContain('CREATE INDEX memory_update_mutations_dispatch_idx');
   });
 });

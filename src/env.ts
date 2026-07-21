@@ -27,7 +27,12 @@ export interface ReclassifyMem0AgentJob {
   metadataJson: string;
 }
 
-export type MemoryJob = ExtractMemoryJob | Mem0ImportJob | ReclassifyMem0AgentJob;
+export interface UpdateMemoryJob {
+  type: 'update-memory';
+  mutationId: string;
+}
+
+export type MemoryJob = ExtractMemoryJob | Mem0ImportJob | ReclassifyMem0AgentJob | UpdateMemoryJob;
 
 export interface Env {
   DB: D1Database;

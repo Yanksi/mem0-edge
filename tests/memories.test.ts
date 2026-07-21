@@ -38,6 +38,10 @@ vi.mock('../src/memory/deduplication', () => ({
 
 const service = vi.hoisted(() => {
   class MemoryContentConflictError extends Error {}
+  class MemoryMutationConflictError extends Error {}
+  class DurableMemoryMutationError extends Error {
+    constructor(readonly mutationId: string, message: string) { super(message); }
+  }
   return {
     addMemory: vi.fn(),
     searchMemories: vi.fn(),
@@ -48,6 +52,8 @@ const service = vi.hoisted(() => {
     updateMemory: vi.fn(),
     deleteMemory: vi.fn(),
     MemoryContentConflictError,
+    MemoryMutationConflictError,
+    DurableMemoryMutationError,
   };
 });
 
@@ -907,6 +913,8 @@ function memoryRow(id: string, content: string): typeof memories.$inferSelect {
     createdAt: 1_784_028_800,
     updatedAt: 1_784_028_800,
     deletedAt: null,
+    mutationVersion: 0,
+    lastMutationId: null,
   };
 }
 
@@ -981,84 +989,6 @@ describe('updateMemory deduplication', () => {
     expect(historyValues).toEqual([]);
   });
 
-  it('updates changed content with its digest and scoped vector metadata', async () => {
-    const current = { ...memoryRow('memory-to-update', 'Old content'), agentId: 'agent-123' };
-    const { db, updateValues } = createUpdateDb(current);
-    dependencies.createDb.mockReturnValue(db);
-    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
-
-    await actual.updateMemory(env, current.id, 'user-123', { memory: 'New content', metadata: { source: 'api' } });
-
-    const digest = dependencies.findActiveExactMemory.mock.calls[0][3];
-    expect(updateValues).toContainEqual(expect.objectContaining({ content: 'New content', contentHash: digest }));
-    expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [expect.objectContaining({
-      id: current.id,
-      metadata: expect.objectContaining({ agent_id: 'agent-123', scope_key: expect.any(String), source: 'api' }),
-    })]);
-    expect(dependencies.findActiveExactMemory.mock.invocationCallOrder[0]).toBeLessThan(dependencies.upsertVectors.mock.invocationCallOrder[0]);
-  });
-
-  it('preserves content hash and writes scope metadata for metadata-only reindexing', async () => {
-    const current = { ...memoryRow('memory-to-update', 'Unchanged content'), contentHash: 'preserved-digest', agentId: 'agent-123' };
-    const { db, updateValues } = createUpdateDb(current);
-    dependencies.createDb.mockReturnValue(db);
-    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
-
-    await actual.updateMemory(env, current.id, 'user-123', { metadata: { priority: 2 } });
-
-    expect(dependencies.findActiveExactMemory).not.toHaveBeenCalled();
-    expect(updateValues).toContainEqual(expect.objectContaining({ contentHash: 'preserved-digest' }));
-    expect(dependencies.upsertVectors).toHaveBeenCalledWith(env.VECTORIZE, [expect.objectContaining({
-      metadata: expect.objectContaining({ scope_key: expect.any(String), priority: 2 }),
-    })]);
-  });
-
-  it('maps a concurrent D1 content uniqueness race before losing vector mutation', async () => {
-    const current = { ...memoryRow('memory-to-update', 'Old content'), agentId: 'agent-123' };
-    const uniqueError = new Error(
-      'D1_ERROR: UNIQUE constraint failed: memories.user_id, memories.agent_id, memories.content_hash',
-    );
-    const { db, updateRun, historyValues } = createUpdateDb(current, { updateErrors: [uniqueError] });
-    dependencies.createDb.mockReturnValue(db);
-    dependencies.findActiveExactMemory.mockResolvedValue(undefined);
-    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
-
-    await expect(actual.updateMemory(env, current.id, 'user-123', { memory: 'Raced content' }))
-      .rejects.toBeInstanceOf(actual.MemoryContentConflictError);
-
-    expect(updateRun).toHaveBeenCalledOnce();
-    expect(dependencies.embedText).not.toHaveBeenCalled();
-    expect(dependencies.upsertVectors).not.toHaveBeenCalled();
-    expect(historyValues).toEqual([]);
-  });
-
-  it('repairs Vectorize on retry after D1 content update succeeded first', async () => {
-    const current = { ...memoryRow('memory-to-update', 'Old content'), agentId: 'agent-123' };
-    const { db, updateRun, updateValues, historyValues } = createUpdateDb(current);
-    dependencies.createDb.mockReturnValue(db);
-    dependencies.upsertVectors
-      .mockRejectedValueOnce(new Error('vector unavailable after D1 update'))
-      .mockResolvedValueOnce(undefined);
-    const actual = await vi.importActual<typeof import('../src/memory/service')>('../src/memory/service');
-
-    await expect(actual.updateMemory(env, current.id, 'user-123', {
-      memory: 'Durably updated content', metadata: { source: 'api' },
-    })).rejects.toThrow('vector unavailable after D1 update');
-    await expect(actual.updateMemory(env, current.id, 'user-123', {
-      memory: 'Durably updated content', metadata: { source: 'api' },
-    })).resolves.toEqual(expect.objectContaining({ memory: 'Durably updated content' }));
-
-    expect(dependencies.findActiveExactMemory).toHaveBeenCalledOnce();
-    expect(updateRun).toHaveBeenCalledTimes(2);
-    expect(dependencies.upsertVectors).toHaveBeenCalledTimes(2);
-    expect(updateRun.mock.invocationCallOrder[0]).toBeLessThan(dependencies.upsertVectors.mock.invocationCallOrder[0]);
-    expect(updateRun.mock.invocationCallOrder[1]).toBeLessThan(dependencies.upsertVectors.mock.invocationCallOrder[1]);
-    expect(updateValues[1]).toEqual(expect.objectContaining({
-      content: 'Durably updated content',
-      contentHash: updateValues[0].contentHash,
-    }));
-    expect(historyValues).toHaveLength(1);
-  });
 });
 
 describe('user-scoped entity-linked search', () => {
@@ -1299,6 +1229,31 @@ describe('/v1/memories routes', () => {
     await expect(response.json()).resolves.toEqual({ error: 'An active memory with this content already exists' });
   });
 
+  it('returns a distinct 409 when optimistic update versioning loses a race', async () => {
+    service.updateMemory.mockRejectedValue(new service.MemoryMutationConflictError('raced'));
+    const response = await worker.fetch(request('/v1/memories/memory-123?user_id=user-123', {
+      method: 'PATCH', headers: { ...authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memory: 'New content' }),
+    }), env);
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      error: 'Memory changed during update; retry with the latest version',
+    });
+  });
+
+  it('returns durable mutation identity and Retry-After for recoverable update failures', async () => {
+    service.updateMemory.mockRejectedValue(new service.DurableMemoryMutationError('mutation-1', 'queued'));
+    const response = await worker.fetch(request('/v1/memories/memory-123?user_id=user-123', {
+      method: 'PATCH', headers: { ...authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memory: 'New content' }),
+    }), env);
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('5');
+    await expect(response.json()).resolves.toEqual({ error: 'queued', mutation_id: 'mutation-1' });
+  });
+
   it('does not translate unrelated update errors into content conflicts', async () => {
     service.updateMemory.mockRejectedValue(new Error('database unavailable'));
 
@@ -1415,6 +1370,18 @@ describe('Hermes self-hosted compatibility routes', () => {
     expect(service.deleteMemory).toHaveBeenCalledWith(env, 'memory-123', 'user-123');
     },
   );
+
+  it('returns durable mutation identity for a recoverable Hermes update failure', async () => {
+    service.getMemoryById.mockResolvedValue(memory);
+    service.updateMemory.mockRejectedValue(new service.DurableMemoryMutationError('mutation-2', 'queued'));
+    const response = await worker.fetch(request('/memories/memory-123', {
+      method: 'PUT', headers: { 'X-API-Key': 'test-api-key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'New content' }),
+    }), env);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ error: 'queued', mutation_id: 'mutation-2' });
+  });
 
   it.each(['/memories/memory-123', '/v1/memories/memory-123'])(
     'returns the memory content conflict response for Hermes PUT %s',

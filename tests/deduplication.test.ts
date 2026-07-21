@@ -71,7 +71,9 @@ beforeEach(async () => {
       content_hash TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      deleted_at INTEGER
+      deleted_at INTEGER,
+      mutation_version INTEGER NOT NULL DEFAULT 0,
+      last_mutation_id TEXT
     )
   `).run();
   await env.DB.prepare(`
@@ -548,7 +550,9 @@ async function memoryById(id: string): Promise<MemoryRow | undefined> {
       content_hash AS contentHash,
       created_at AS createdAt,
       updated_at AS updatedAt,
-      deleted_at AS deletedAt
+      deleted_at AS deletedAt,
+      mutation_version AS mutationVersion,
+      last_mutation_id AS lastMutationId
     FROM memories
     WHERE id = ?
   `).bind(id).first<MemoryRow>();

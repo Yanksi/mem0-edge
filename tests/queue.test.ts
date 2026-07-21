@@ -17,9 +17,17 @@ const importService = vi.hoisted(() => ({
   processMem0ImportJob: vi.fn(),
   processMem0AgentReclassificationJob: vi.fn(),
 }));
+const updateService = vi.hoisted(() => ({
+  isUpdateMemoryJob: vi.fn((value: unknown) => (
+    typeof value === 'object' && value !== null && (value as { type?: string }).type === 'update-memory'
+  )),
+  processMemoryUpdateMutation: vi.fn(),
+  dispatchPendingMemoryUpdates: vi.fn(),
+}));
 
 vi.mock('../src/memory/service', () => service);
 vi.mock('../src/import/service', () => importService);
+vi.mock('../src/memory/update-mutations', () => updateService);
 
 import { handleMemoryQueue } from '../src/queue';
 import worker from '../src/index';
@@ -48,6 +56,7 @@ describe('handleMemoryQueue', () => {
     vi.clearAllMocks();
     service.processMemoryJob.mockReset();
     importService.processMem0ImportJob.mockReset();
+    updateService.processMemoryUpdateMutation.mockReset();
   });
 
   it('acknowledges a successfully processed job', async () => {
@@ -68,6 +77,27 @@ describe('handleMemoryQueue', () => {
     expect(service.processMemoryJob).not.toHaveBeenCalled();
     expect(job.ack).toHaveBeenCalledOnce();
     expect(job.retry).not.toHaveBeenCalled();
+  });
+
+  it('processes durable update jobs by mutation ID and acknowledges success', async () => {
+    const job = message({ type: 'update-memory', mutationId: 'mutation-1' });
+
+    await handleMemoryQueue(batch(job), env);
+
+    expect(updateService.processMemoryUpdateMutation).toHaveBeenCalledWith(env, 'mutation-1');
+    expect(job.ack).toHaveBeenCalledOnce();
+  });
+
+  it('retries transient durable update failures', async () => {
+    const job = message({ type: 'update-memory', mutationId: 'mutation-1' }, 2);
+    updateService.processMemoryUpdateMutation.mockRejectedValue(Object.assign(
+      new Error('Vector service unavailable'), { retryable: true },
+    ));
+
+    await handleMemoryQueue(batch(job), env);
+
+    expect(job.retry).toHaveBeenCalledWith({ delaySeconds: 30 });
+    expect(job.ack).not.toHaveBeenCalled();
   });
 
   it('retries transient processing failures without acknowledging the message', async () => {

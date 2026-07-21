@@ -10,6 +10,8 @@ import {
   getMemoryOwnerById,
   listMemories,
   MemoryContentConflictError,
+  MemoryMutationConflictError,
+  DurableMemoryMutationError,
   searchMemories,
   updateMemory,
 } from '../memory/service';
@@ -66,6 +68,13 @@ memoriesRoutes.patch('/:id', async (context) => {
   } catch (error) {
     if (error instanceof MemoryContentConflictError) {
       return context.json({ error: 'An active memory with this content already exists' }, 409);
+    }
+    if (error instanceof MemoryMutationConflictError) {
+      return context.json({ error: 'Memory changed during update; retry with the latest version' }, 409);
+    }
+    if (error instanceof DurableMemoryMutationError) {
+      context.header('Retry-After', '5');
+      return context.json({ error: error.message, mutation_id: error.mutationId }, 503);
     }
     throw error;
   }

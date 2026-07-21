@@ -42,6 +42,8 @@ export const memories = sqliteTable(
     createdAt,
     updatedAt,
     deletedAt: integer('deleted_at'),
+    mutationVersion: integer('mutation_version').notNull().default(0),
+    lastMutationId: text('last_mutation_id'),
   },
   (table) => [
     index('memories_user_agent_deleted_at_idx').on(
@@ -187,6 +189,60 @@ export const mem0ImportRequests = sqliteTable(
       table.status,
       table.publishedAt,
       table.publishAttemptedAt,
+    ),
+  ],
+);
+
+export const memoryUpdateMutations = sqliteTable(
+  'memory_update_mutations',
+  {
+    mutationId: text('mutation_id').primaryKey(),
+    memoryId: text('memory_id').notNull().references(() => memories.id, { onDelete: 'cascade' }),
+    userId: text('user_id').notNull(),
+    baseVersion: integer('base_version').notNull(),
+    targetVersion: integer('target_version').notNull(),
+    targetContent: text('target_content').notNull(),
+    targetContentHash: text('target_content_hash').notNull(),
+    targetMetadataJson: text('target_metadata_json').notNull(),
+    graphJson: text('graph_json'),
+    status: text('status').notNull(),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    leaseToken: integer('lease_token').notNull().default(0),
+    leaseExpiresAt: integer('lease_expires_at'),
+    publishToken: integer('publish_token').notNull().default(0),
+    publishAttemptedAt: integer('publish_attempted_at'),
+    publishedAt: integer('published_at'),
+    errorMessage: text('error_message'),
+    createdAt,
+    updatedAt,
+    completedAt: integer('completed_at'),
+  },
+  (table) => [
+    uniqueIndex('memory_update_mutations_active_memory_idx')
+      .on(table.memoryId)
+      .where(sql`${table.status} NOT IN ('completed', 'superseded', 'failed_conflict')`),
+    index('memory_update_mutations_dispatch_idx').on(
+      table.status, table.publishedAt, table.publishAttemptedAt, table.updatedAt,
+    ),
+  ],
+);
+
+export const memoryUpdateVectorIntents = sqliteTable(
+  'memory_update_vector_intents',
+  {
+    mutationId: text('mutation_id').notNull().references(() => memoryUpdateMutations.mutationId, { onDelete: 'cascade' }),
+    indexKind: text('index_kind').notNull(),
+    vectorId: text('vector_id').notNull(),
+    valuesJson: text('values_json').notNull(),
+    metadataJson: text('metadata_json').notNull(),
+    targetHash: text('target_hash').notNull(),
+    status: text('status').notNull().default('pending'),
+    updatedAt,
+  },
+  (table) => [
+    primaryKey({ columns: [table.mutationId, table.indexKind, table.vectorId] }),
+    index('memory_update_vector_intents_pending_idx').on(
+      table.mutationId, table.status, table.indexKind, table.vectorId,
     ),
   ],
 );
